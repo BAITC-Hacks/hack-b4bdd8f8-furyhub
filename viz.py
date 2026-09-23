@@ -271,10 +271,13 @@ div.vis-tooltip{max-width:390px;white-space:pre-wrap!important;overflow-wrap:any
 @media(max-width:1000px){body{overflow:auto}header{height:auto;flex-wrap:wrap}.brand{flex:1}.funnel{order:3;flex-basis:100%;justify-content:flex-start;padding:14px 0 0;border-top:1px solid var(--line)}#app{height:auto;min-height:800px;grid-template-columns:260px minmax(0,1fr)}.queue-panel{max-height:740px}.center{height:740px}#details{grid-column:1/-1;overflow:visible;border-top:1px solid var(--line);border-left:0;padding:26px}.flow-tiles{max-width:500px}}
 @media(max-width:620px){header{padding:17px}.brand-name{font-size:25px}.brand{gap:9px}#overview{font-size:10px;padding:8px}.funnel{gap:14px}.funnel strong{font-size:25px}.funnel-step{min-width:64px}.funnel-arrow{font-size:16px}#app{display:flex;flex-direction:column}.queue-panel{max-height:360px;border-right:0;border-bottom:1px solid var(--line)}.queue-head{padding:18px 16px 12px}h2.section-label{font-size:21px}#status{min-height:0;margin-bottom:15px}.center{height:570px;flex:none}.canvas-header{padding:20px 16px}.canvas-title{font-size:25px}.canvas-wrap{min-height:300px}.queue-gid{font-size:12px}.queue-role{font-size:13px}.queue-why{-webkit-line-clamp:1}.center-footer{padding:13px 16px}#details{padding:24px 20px}.peer-row{padding:11px 3px}.peer-id,.peer-amount{font-size:12px}}
 @media(prefers-reduced-motion:reduce){button{transition:none}}
+.embedded header{height:46px;padding:6px 18px;flex-wrap:nowrap}.embedded header:before{content:'Исследование сети';font:18px var(--serif);color:var(--accent)}.embedded .brand,.embedded .funnel{display:none}.embedded #app{height:calc(100dvh - 46px)}.embedded .canvas-header{padding:14px 18px}.embedded .canvas-title{font-size:22px}.embedded .canvas-heading .eyebrow{display:none}
+@media(max-width:1000px){.embedded #app{height:auto;min-height:0;grid-template-columns:210px minmax(0,1fr)}.embedded .center,.embedded .queue-panel{height:680px}.embedded .queue-head{padding:14px 12px}.embedded .queue-item{padding:12px}.embedded .canvas-title{font-size:20px}.embedded #details{grid-column:1/-1}}
+@media(max-width:700px){.embedded #app{display:flex;flex-direction:column}.embedded .queue-panel{height:auto;max-height:220px;order:2}.embedded .center{height:620px;order:1}.embedded #details{order:3}.embedded .queue-head{padding:10px 14px}.embedded .queue-head h2,.embedded .queue-subtitle{display:none}.embedded #status{margin-bottom:0}.embedded .canvas-header{padding:12px}.embedded .canvas-title{font-size:20px}.embedded .center-footer{padding:10px 12px}}
 </style>
 <script>__VIS_JS__</script>
 </head>
-<body>
+<body class="__BODY_CLASS__">
 <header>
  <div class="brand"><div class="brand-name"><b>FuryHub</b><small>Граф денег · рабочее место аналитика</small></div></div>
  <div class="funnel" aria-label="От известных клиентов к очереди проверки">
@@ -408,7 +411,7 @@ function renderCard(gid) {
     setText('detail-meaning',node.role_meaning);setText('detail-gid',gid);setText('copy-gid','копировать');
     el('badges').replaceChildren();
     if(top) badge(`№${top.rank} в очереди проверки`,'queue-badge');
-    if(node.is_seed) badge('из списка по делу (seed)','seed-badge');
+    if(node.is_seed) badge('исходный клиент (seed)','seed-badge');
     if(node.truncated_by_depth) badge('обход оборвался на 4-м шаге: дальнейшие переводы не видны','warning');
     if(node.incoming_incomplete && !node.seed_incoming_incomplete) badge('неполный видимый вход','warning');
     if(!node.outgoing_coverage_known) badge('полнота исходящих неизвестна','warning');
@@ -615,7 +618,8 @@ def build_html(data):
     for character, escaped in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026"),
                                ("\u2028", "\\u2028"), ("\u2029", "\\u2029")):
         serialized = serialized.replace(character, escaped)
-    return PAGE.replace("__VIS_CSS__", css).replace("__VIS_JS__", javascript).replace("__DATA__", serialized)
+    return (PAGE.replace("__BODY_CLASS__", "embedded" if data.get("embedded") else "")
+            .replace("__VIS_CSS__", css).replace("__VIS_JS__", javascript).replace("__DATA__", serialized))
 
 
 def main(argv=None):

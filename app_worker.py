@@ -41,6 +41,7 @@ def analyse(data_dir, out_dir, parameters):
     visual_nodes, visual_edges = load_data(out_dir / "nodes_roles.csv", data_dir / "edges.parquet")
     top = load_top(out_dir / "top_nodes.csv", visual_nodes)
     data = build_data(visual_nodes, visual_edges, top)
+    data["embedded"] = True
     data["hints"] = collect_hints(visual_nodes, visual_edges, top, out_dir, offline=True)
     (out_dir / "graph.html").write_text(build_html(data), encoding="utf-8")
     packages = {name: importlib.metadata.version(name)
