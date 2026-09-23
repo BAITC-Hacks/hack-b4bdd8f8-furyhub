@@ -25,9 +25,15 @@ class RulesTests(unittest.TestCase):
             ({"in_deg": 5, "out_deg": 10, "out_kzt": 10_000,
               "seed_payers": 2, "betweenness": 1.0}, "coordinator", 0.9),
             ({"in_deg": 5, "out_deg": 10, "out_kzt": 10_000}, "distributor", 0.55),
-            ({"in_deg": 5, "out_deg": 0, "out_kzt": 0}, "consolidator", 0.75),
-            # Seed exclusion applies even when the consolidation condition matches.
-            ({"in_deg": 5, "out_deg": 0, "out_kzt": 0, "is_seed": True}, "terminal", 0.7),
+            ({"in_deg": 5, "out_deg": 0, "out_kzt": 0, "pass_through": 0.0}, "consolidator", 0.75),
+            ({"in_deg": 5, "out_deg": 0, "out_kzt": 0, "pass_through": 0.0,
+              "is_seed": True}, "consolidator", 0.75),
+            ({"in_deg": 3, "seed_payers": 2, "pass_through": 0.49}, "consolidator", 0.65),
+            ({"in_deg": 3, "in_kzt": 400_000, "pass_through": 0.49}, "consolidator", 0.65),
+            ({"in_deg": 3, "in_kzt": 399_999, "seed_payers": 1,
+              "pass_through": 0.49}, "peripheral", 0.4),
+            ({"in_deg": 2, "seed_payers": 2, "in_kzt": 400_000,
+              "pass_through": 0.49}, "peripheral", 0.4),
             ({"in_deg": 5, "out_kzt": 50_000, "pass_through": 0.5}, "peripheral", 0.4),
             ({"pass_through": 0.8}, "transit", 0.7),
             ({"pass_through": 1.2}, "transit", 0.7),
@@ -35,7 +41,10 @@ class RulesTests(unittest.TestCase):
             ({"out_deg": 0, "in_kzt": 50_000, "depth": 3}, "terminal", 0.7),
             ({"out_deg": 0, "in_kzt": 49_999}, "peripheral", 0.4),
             ({"out_deg": 0, "depth": 4}, "peripheral", 0.3),
-            ({"out_deg": 9, "pass_through": 2.0}, "peripheral", 0.4),
+            ({"out_deg": 9, "pass_through": 2.0}, "transit", 0.5),
+            ({"pass_through": 1.200001}, "transit", 0.5),
+            ({"is_seed": True, "pass_through": 2.0}, "peripheral", 0.4),
+            ({"is_seed": True, "pass_through": 1.0}, "transit", 0.9),
         ]
         frame = pd.DataFrame([base | patch | {"gid": i} for i, (patch, _, _) in enumerate(cases)])
         actual = run.assign_roles(frame)
@@ -47,10 +56,36 @@ class RulesTests(unittest.TestCase):
     def test_minmax_penalty_and_score_range(self):
         frame = pd.DataFrame({column: [0.0, 10.0, 0.0] for column in run.PRIORITY_WEIGHTS})
         frame["truncated_by_depth"] = [False, True, True]
+        frame["role"] = ["peripheral", "coordinator", "terminal"]
         result = run.add_priority(frame)
-        self.assertEqual(result.priority_score.round(8).tolist(), [0.0, 0.7, 0.0])
+        self.assertEqual(result.priority_score.round(8).tolist(), [0.0, 1.0, 0.0])
         self.assertEqual(result.priority_score_raw.round(8).tolist(), [0.0, 0.7, -0.3])
         self.assertEqual(run.minmax(pd.Series([7.0, 7.0])).tolist(), [0.0, 0.0])
+
+    def test_role_weights(self):
+        roles = ["peripheral", "coordinator", "consolidator", "distributor", "transit", "terminal", "peripheral"]
+        frame = pd.DataFrame({column: [0.0] + [1.0] * 6 for column in run.PRIORITY_WEIGHTS})
+        frame["truncated_by_depth"] = False
+        frame["role"] = roles
+        self.assertEqual(run.add_priority(frame).priority_score.round(8).tolist(),
+                         [0.0, 1.0, 1.0, 0.9, 0.8, 0.6, 0.4])
+
+    def test_coordinator_percentile_and_seed_payers(self):
+        frame = pd.DataFrame({
+            "betweenness": range(100), "in_deg": 3, "out_deg": 3,
+            "seed_payers": 1, "is_seed": False, "pass_through": 0.6,
+        })
+        frame.loc[99, "seed_payers"] = 0
+        result = run.assign_roles(frame)
+        self.assertEqual(result.index[result.role.eq("coordinator")].tolist(), [95, 96, 97, 98])
+
+    def test_evidence_declension(self):
+        for count in [1, 3, 11, 21, 61, 111]:
+            singular = count in [1, 21, 61]
+            self.assertEqual(run.counted_people(count, "плательщика", "плательщиков"),
+                             f"{count} " + ("плательщика" if singular else "плательщиков"))
+            self.assertEqual(run.counted_people(count, "получателя", "получателей"),
+                             f"{count} " + ("получателя" if singular else "получателей"))
 
     def test_projection_preserves_reciprocal_flows_and_isolates(self):
         graph = nx.DiGraph()
@@ -76,7 +111,19 @@ class OutputTests(unittest.TestCase):
         self.assertTrue(roles.evidence.str.len().between(1, 200).all())
         self.assertTrue(roles.evidence.str.contains(r"\d").all())
         self.assertTrue(roles.loc[roles.is_seed, "evidence"].str.contains(run.SEED_NOTE, regex=False).all())
-        self.assertFalse((roles.is_seed & roles.role.eq("consolidator")).any())
+        seed_consolidators = roles.loc[roles.is_seed & roles.role.eq("consolidator")]
+        self.assertFalse(seed_consolidators.empty)
+        for row in seed_consolidators.itertuples():
+            self.assertIn(f"из них seed-плательщиков {row.seed_payers}", row.evidence)
+        self.assertEqual(int(roles.role.eq("coordinator").sum()), 23)
+        self.assertTrue(roles.loc[roles.role.eq("coordinator"), "evidence"].str.contains(
+            "в топ-5% по посреднической роли в сети", regex=False).all())
+        missing_incoming = roles.loc[roles.role_rule.eq("transit_missing_incoming")]
+        self.assertFalse(missing_incoming.empty)
+        self.assertFalse(missing_incoming.is_seed.any())
+        self.assertTrue(missing_incoming.role_score.eq(0.5).all())
+        self.assertTrue(missing_incoming.evidence.str.contains(
+            "кандидат на запрос входящих переводов", regex=False).all())
         self.assertFalse((roles.truncated_by_depth & roles.role.eq("terminal")).any())
         required = ["gid", "role", "role_score", "cluster_id", "priority_score", "evidence"]
         self.assertFalse(roles[required].isna().any().any())
@@ -87,6 +134,8 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(len(top), 25)
         self.assertEqual(top["rank"].tolist(), list(range(1, 26)))
         self.assertTrue(top.priority_score.is_monotonic_decreasing)
+        self.assertFalse(top.head(10).role.eq("peripheral").any())
+        self.assertEqual(roles.priority_score.max(), 1.0)
         self.assertEqual(top.gid.tolist(), run.rank_nodes(roles).head(25).gid.tolist())
         self.assertFalse(top.why.isna().any())
         # Reconstruct scores independently from the published formula.
@@ -98,7 +147,12 @@ class OutputTests(unittest.TestCase):
         ]:
             expected += weight * (values - values.min()) / (values.max() - values.min())
         expected -= 0.30 * roles.truncated_by_depth
-        self.assertLess((roles.priority_score - expected.clip(0, 1)).abs().max(), 1e-12)
+        expected = expected.clip(0, 1) * roles.role.map({
+            "coordinator": 1.0, "consolidator": 1.0, "distributor": 0.9,
+            "transit": 0.8, "terminal": 0.6, "peripheral": 0.4,
+        })
+        expected = (expected - expected.min()) / (expected.max() - expected.min())
+        self.assertLess((roles.priority_score - expected).abs().max(), 1e-12)
         seed_set = set(nodes.loc[nodes.is_seed, "gid"])
         counts = edges.loc[edges.src.isin(seed_set)].groupby("dst").src.nunique()
         payers = roles.gid.map(counts).fillna(0)
@@ -114,6 +168,18 @@ class OutputTests(unittest.TestCase):
             self.assertAlmostEqual(cluster.sum_kzt_internal, edges.loc[internal, "sum_kzt"].sum())
             self.assertEqual(cluster.n_nodes, len(group))
             self.assertEqual(cluster.top_gids, ";".join(run.rank_nodes(group).head(5).gid.astype(str)))
+            self.assertTrue(cluster.hypothesis.startswith("Гипотеза для проверки:"))
+            self.assertIn(f"seed — {int(group.is_seed.sum())}", cluster.hypothesis)
+            for role in run.ROLES:
+                self.assertIn(f"{role} — {int(group.role.eq(role).sum())}", cluster.hypothesis)
+            share = group.turnover_kzt.sum() / roles.turnover_kzt.sum()
+            self.assertIn(f"доля общего оборота (вход + выход) — {share:.2%}", cluster.hypothesis)
+            if cluster.n_seed == 0:
+                self.assertIn("связь с делом не подтверждена", cluster.hypothesis)
+            if cluster.n_seed >= 3 and group.role.eq("consolidator").any():
+                self.assertIn("признаки сбора средств от курьеров", cluster.hypothesis)
+            if group.role.eq("distributor").any() and group.role.eq("terminal").sum() >= 3:
+                self.assertIn("признаки веерного распределения", cluster.hypothesis)
 
 
 if __name__ == "__main__":

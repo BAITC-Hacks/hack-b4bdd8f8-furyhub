@@ -23,10 +23,13 @@ from starter.starter import ROLES, basic_features, build_graph, load, sanity_che
 THRESHOLDS = {
     "coordinator_in_deg": 3,
     "coordinator_out_deg": 3,
-    "coordinator_betweenness_quantile": 0.99,
-    "coordinator_seed_payers": 2,
+    "coordinator_betweenness_quantile": 0.95,
+    "coordinator_seed_payers": 1,
     "distributor_out_deg": 10,
     "consolidator_in_deg": 5,
+    "consolidator_supported_in_deg": 3,
+    "consolidator_seed_payers": 2,
+    "consolidator_in_kzt": 400_000,
     "consolidator_out_in_ratio": 0.5,
     "transit_in_deg": 1,
     "transit_out_deg": 1,
@@ -42,6 +45,14 @@ PRIORITY_WEIGHTS = {
     "turnover_kzt": 0.20,
     "seed_payers_share": 0.10,
     "betweenness": 0.10,
+}
+ROLE_PRIORITY_WEIGHTS = {
+    "coordinator": 1.0,
+    "consolidator": 1.0,
+    "distributor": 0.9,
+    "transit": 0.8,
+    "terminal": 0.6,
+    "peripheral": 0.4,
 }
 DEPTH_PENALTY = 0.30
 RANDOM_SEED = 42
@@ -147,7 +158,7 @@ def compute_features(edges, nodes):
 
 
 def assign_roles(df):
-    """Порядок if/elif в точности соответствует таблице PLAN.md."""
+    """Первое совпадение выигрывает; пороги уточнены по проверке выгрузок."""
     df = df.copy()
     t = THRESHOLDS
     cutoff = df.betweenness.quantile(t["coordinator_betweenness_quantile"])
@@ -170,10 +181,17 @@ def assign_roles(df):
             role = reason = "distributor"
             score = min(0.95, 0.5 + 0.05 * (row.out_deg // 10))
         elif (
-            not row.is_seed
-            and row.in_deg >= t["consolidator_in_deg"]
-            and row.out_kzt < t["consolidator_out_in_ratio"] * row.in_kzt
+            row.pass_through < t["consolidator_out_in_ratio"]
+            and (
+                row.in_deg >= t["consolidator_in_deg"]
+                or (
+                    row.in_deg >= t["consolidator_supported_in_deg"]
+                    and (row.seed_payers >= t["consolidator_seed_payers"]
+                         or row.in_kzt >= t["consolidator_in_kzt"])
+                )
+            )
         ):
+            # У seed реальный вход выше: реальная доля передачи ещё ниже.
             role = reason = "consolidator"
             # PLAN задаёт зависимость от in_deg без формулы: +0.05 за плательщика.
             score = min(0.95, 0.5 + 0.05 * row.in_deg)
@@ -184,6 +202,13 @@ def assign_roles(df):
         ):
             role = reason = "transit"
             score = max(0.0, 0.9 - abs(1.0 - row.pass_through))
+        elif (
+            not row.is_seed
+            and row.in_deg >= t["transit_in_deg"]
+            and row.out_deg >= t["transit_out_deg"]
+            and row.pass_through > t["transit_pass_max"]
+        ):
+            role, score, reason = "transit", 0.5, "transit_missing_incoming"
         elif (
             row.out_deg == 0 and row.depth < t["depth_limit"]
             and row.in_kzt >= t["terminal_in_kzt"]
@@ -206,29 +231,42 @@ def add_priority(df):
         weight * minmax(df[column]) for column, weight in PRIORITY_WEIGHTS.items()
     ) - DEPTH_PENALTY * df.truncated_by_depth.astype(int)
     # ТЗ требует 0..1. Сохраняем сырой результат для проверки штрафа.
-    df["priority_score"] = df.priority_score_raw.clip(0.0, 1.0)
+    weighted = df.priority_score_raw.clip(0.0, 1.0) * df.role.map(ROLE_PRIORITY_WEIGHTS)
+    df["priority_score"] = minmax(weighted)
     return df
+
+
+def counted_people(count, singular, plural):
+    """Родительный после «от» и винительный после «на» для лиц."""
+    word = singular if count % 10 == 1 and count % 100 != 11 else plural
+    return f"{count} {word}"
 
 
 def evidence(row):
     incoming = f"{row.in_kzt:,.0f}".replace(",", " ")
     outgoing = f"{row.out_kzt:,.0f}".replace(",", " ")
+    payers = counted_people(row.in_deg, "плательщика", "плательщиков")
+    recipients = counted_people(row.out_deg, "получателя", "получателей")
     if row.role_rule == "no_edges":
         text = "0 входящих и 0 исходящих рёбер; недостаточно данных для гипотезы о роли"
     elif row.role == "coordinator":
         text = (f"Вход/выход: {row.in_deg}/{row.out_deg} связей; seed-плательщиков "
-                f"{row.seed_payers}; betweenness={row.betweenness:.5f}; признаки координации")
+                f"{row.seed_payers}; в топ-5% по посреднической роли в сети; признаки координации")
     elif row.role == "distributor":
-        text = (f"Отправляет {outgoing} KZT на {row.out_deg} получателей, "
+        text = (f"Отправляет {outgoing} KZT на {recipients}, "
                 f"{row.out_tx} переводов; признаки распределения")
     elif row.role == "consolidator":
-        text = (f"Получает {incoming} KZT от {row.in_deg} плательщиков, "
+        seed_payers = f"из них seed-плательщиков {row.seed_payers}; " if row.is_seed else ""
+        text = (f"Вход {incoming} KZT от {payers}; {seed_payers}"
                 f"передаёт {row.pass_through:.1%}; признаки консолидации")
+    elif row.role_rule == "transit_missing_incoming":
+        text = (f"отдаёт в {row.pass_through:.2f} раз больше видимого входа — "
+                "вероятны входящие вне выборки; кандидат на запрос входящих переводов")
     elif row.role == "transit":
         text = (f"Вход {incoming}, выход {outgoing} KZT; передаёт {row.pass_through:.1%}; "
                 f"{row.in_deg}/{row.out_deg} связей; признаки транзита")
     elif row.role == "terminal":
-        text = (f"Вход {incoming} KZT от {row.in_deg} плательщиков, выход 0; "
+        text = (f"Вход {incoming} KZT от {payers}, выход 0; "
                 f"глубина {row.depth}; признаки конечного получателя")
     elif row.role_rule == "truncated":
         text = (f"Глубина {row.depth}, выход 0, вход {incoming} KZT; "
@@ -255,17 +293,39 @@ def cluster_summary(df, edges):
     internal = edges.loc[src_cluster.eq(dst_cluster)].copy()
     internal["cluster_id"] = src_cluster.loc[internal.index]
     sums = internal.groupby("cluster_id").sum_kzt.sum()
+    total_turnover = df.turnover_kzt.sum()
     rows = []
     for cid, group in df.groupby("cluster_id", sort=True):
         n_nodes, n_seed = len(group), int(group.is_seed.sum())
         amount = float(sums.get(cid, 0.0))
+        counts = group.role.value_counts().reindex(ROLES, fill_value=0)
+        turnover_share = group.turnover_kzt.sum() / total_turnover if total_turnover else 0.0
+        observations = []
+        if n_seed == 0:
+            observations.append("связь с делом не подтверждена, вероятно, downstream-получатели")
+        if counts["consolidator"]:
+            observations.append(
+                "признаки сбора средств от курьеров" if n_seed >= 3
+                else "признаки консолидации средств"
+            )
+        if counts["coordinator"]:
+            observations.append("возможная координация денежных потоков")
+        if counts["distributor"] and counts["terminal"] >= 3:
+            observations.append("признаки веерного распределения")
+        if not observations:
+            observations.append("назначение группы денежных потоков требует уточнения")
+        if turnover_share >= 0.10:
+            observations.append("значимая доля общего оборота, проверить назначение крупных потоков")
+        composition = ", ".join(f"{role} — {int(counts[role])}" for role in ROLES)
         rows.append({
             "cluster_id": cid, "n_nodes": n_nodes, "n_seed": n_seed,
             "sum_kzt_internal": amount,
             "top_gids": ";".join(rank_nodes(group).head(5).gid.astype(str)),
             "hypothesis": (f"Гипотеза для проверки: группа из {n_nodes} узлов, "
-                           f"seed — {n_seed}; внутренние переводы {amount:,.0f} KZT; "
-                           "возможная общность денежных потоков требует проверки."),
+                           f"seed — {n_seed}; роли: {composition}; "
+                           f"внутренние переводы {amount:,.0f} KZT; "
+                           f"доля общего оборота (вход + выход) — {turnover_share:.2%}; "
+                           + "; ".join(observations) + "."),
         })
     return pd.DataFrame(rows)
 
@@ -315,6 +375,8 @@ def main():
     print("Сводка ролей:")
     for role in ROLES:
         print(f"  {role}: {int(df.role.eq(role).sum())}")
+    print("Топ-10 по приоритету:")
+    print(rank_nodes(df).head(10)[["gid", "role", "priority_score"]].to_string(index=False))
 
 
 if __name__ == "__main__":
