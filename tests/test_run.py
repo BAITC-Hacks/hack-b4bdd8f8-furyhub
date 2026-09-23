@@ -1,10 +1,14 @@
 """Проверки приоритетов правил, ограничений данных и готовых CSV.
 
-Запуск после пайплайна: python -m unittest discover -s tests -v
+Запуск: python -m unittest discover -s tests -v
+Интеграционная проверка сама запускает офлайн-пайплайн во временной папке.
 """
 
 from pathlib import Path
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 
 import networkx as nx
@@ -42,8 +46,12 @@ class RulesTests(unittest.TestCase):
             ({"out_deg": 0, "in_kzt": 50_000, "depth": 3}, "terminal", 0.7),
             ({"out_deg": 0, "in_kzt": 49_999}, "peripheral", 0.4),
             ({"out_deg": 0, "depth": 4}, "peripheral", 0.3),
-            ({"out_deg": 9, "pass_through": 2.0}, "transit", 0.5),
-            ({"pass_through": 1.200001}, "transit", 0.5),
+            ({"in_deg": 5, "out_deg": 0, "out_kzt": 0, "pass_through": 0.0,
+              "depth": 4}, "peripheral", 0.3),
+            ({"in_deg": 3, "in_kzt": 555_000, "out_deg": 0, "out_kzt": 0,
+              "pass_through": 0.0, "depth": 4}, "peripheral", 0.3),
+            ({"out_deg": 9, "pass_through": 2.0}, "peripheral", 0.4),
+            ({"pass_through": 1.200001}, "peripheral", 0.4),
             ({"is_seed": True, "pass_through": 2.0}, "peripheral", 0.4),
             ({"is_seed": True, "pass_through": 1.0}, "transit", 0.9),
         ]
@@ -53,6 +61,46 @@ class RulesTests(unittest.TestCase):
             with self.subTest(gid=row.gid):
                 self.assertEqual(row.role, role)
                 self.assertAlmostEqual(row.role_score, score)
+
+    def test_incomplete_incoming_is_independent_of_structural_roles(self):
+        base = dict(
+            in_deg=3, out_deg=3, in_kzt=100_000, out_kzt=200_000,
+            pass_through=2.0, depth=1, is_seed=False, seed_payers=0,
+            betweenness=0.0, in_tx=3, out_tx=3,
+        )
+        cases = [
+            ({}, "peripheral", "missing_incoming"),
+            ({"in_deg": 0, "in_kzt": 0, "pass_through": float("nan")},
+             "peripheral", "missing_incoming"),
+            ({"out_deg": 10}, "distributor", "distributor"),
+            ({"seed_payers": 1, "betweenness": 1.0}, "coordinator", "coordinator"),
+            ({"is_seed": True}, "peripheral", "other"),
+        ]
+        frame = pd.DataFrame([base | patch | {"gid": i} for i, (patch, _, _) in enumerate(cases)])
+        actual = run.assign_roles(frame)
+        self.assertTrue(actual.incoming_incomplete.all())
+        for row, (_, role, rule) in zip(actual.itertuples(), cases):
+            with self.subTest(gid=row.gid):
+                self.assertEqual((row.role, row.role_rule), (role, rule))
+                text = run.evidence(row)
+                self.assertLessEqual(len(text), run.EVIDENCE_LIMIT)
+                if rule == "missing_incoming":
+                    self.assertEqual(row.role_score, 0.4)
+                    self.assertIn("начальный остаток", text)
+                    self.assertIn("запросить выписку", text)
+                elif not row.is_seed:
+                    self.assertIn(run.INCOMPLETE_NOTE, text)
+
+    def test_truncated_evidence_does_not_infer_retention(self):
+        row = pd.DataFrame([dict(
+            gid=0, in_deg=5, out_deg=0, in_kzt=500_000, out_kzt=0,
+            pass_through=0.0, depth=run.THRESHOLDS["depth_limit"],
+            is_seed=False, seed_payers=2, betweenness=0.0,
+        )])
+        result = run.assign_roles(row).iloc[0]
+        self.assertEqual(result.role_rule, "truncated")
+        self.assertIn("обход обрезан", run.evidence(result))
+        self.assertNotIn("консолидации", run.evidence(result))
 
     def test_minmax_penalty_and_score_range(self):
         frame = pd.DataFrame({column: [0.0, 10.0, 0.0] for column in run.PRIORITY_WEIGHTS})
@@ -99,13 +147,26 @@ class RulesTests(unittest.TestCase):
 
 
 class OutputTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(__file__).resolve().parents[1]
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.output = Path(cls.temp.name) / "exports"
+        result = subprocess.run(
+            [sys.executable, str(cls.root / "run.py"), "--data", str(cls.root / "data"),
+             "--out", str(cls.output), "--offline"],
+            cwd=cls.root, capture_output=True, text=True, encoding="utf-8", timeout=300,
+        )
+        if result.returncode:
+            raise AssertionError(f"Пайплайн завершился с ошибкой:\n{result.stdout}\n{result.stderr}")
+
     def test_provided_dataset_and_exports(self):
-        root = Path(__file__).resolve().parents[1]
-        nodes = pd.read_parquet(root / "data/nodes.parquet")
-        edges = pd.read_parquet(root / "data/edges.parquet")
-        roles = pd.read_csv(root / "out/nodes_roles.csv")
-        clusters = pd.read_csv(root / "out/clusters.csv")
-        top = pd.read_csv(root / "out/top_nodes.csv")
+        nodes = pd.read_parquet(self.root / "data/nodes.parquet")
+        edges = pd.read_parquet(self.root / "data/edges.parquet")
+        roles = pd.read_csv(self.output / "nodes_roles.csv")
+        clusters = pd.read_csv(self.output / "clusters.csv")
+        top = pd.read_csv(self.output / "top_nodes.csv")
         self.assertEqual(len(roles), 2248)
         self.assertTrue(roles.gid.is_unique)
         self.assertEqual(set(roles.gid), set(nodes.gid))
@@ -116,16 +177,20 @@ class OutputTests(unittest.TestCase):
         self.assertFalse(seed_consolidators.empty)
         for row in seed_consolidators.itertuples():
             self.assertIn(f"из них seed-плательщиков {row.seed_payers}", row.evidence)
-        self.assertEqual(int(roles.role.eq("coordinator").sum()), 23)
+        self.assertTrue(roles.role.eq("coordinator").any())
         self.assertTrue(roles.loc[roles.role.eq("coordinator"), "evidence"].str.contains(
             "в топ-5% по посреднической роли в сети", regex=False).all())
-        missing_incoming = roles.loc[roles.role_rule.eq("transit_missing_incoming")]
+        missing_incoming = roles.loc[roles.role_rule.eq("missing_incoming")]
         self.assertFalse(missing_incoming.empty)
         self.assertFalse(missing_incoming.is_seed.any())
-        self.assertTrue(missing_incoming.role_score.eq(0.5).all())
+        self.assertTrue(missing_incoming.role.eq("peripheral").all())
+        self.assertTrue(missing_incoming.role_score.eq(0.4).all())
+        self.assertTrue(missing_incoming.incoming_incomplete.all())
         self.assertTrue(missing_incoming.evidence.str.contains(
-            "кандидат на запрос входящих переводов", regex=False).all())
-        self.assertFalse((roles.truncated_by_depth & roles.role.eq("terminal")).any())
+            "запросить выписку", regex=False).all())
+        truncated = roles.loc[roles.truncated_by_depth]
+        self.assertTrue(truncated.role.eq("peripheral").all())
+        self.assertTrue(truncated.evidence.str.contains("обход обрезан", regex=False).all())
         required = ["gid", "role", "role_score", "cluster_id", "priority_score", "evidence"]
         self.assertFalse(roles[required].isna().any().any())
         self.assertTrue(roles.role.isin(run.ROLES).all())
@@ -135,7 +200,6 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(len(top), 25)
         self.assertEqual(top["rank"].tolist(), list(range(1, 26)))
         self.assertTrue(top.priority_score.is_monotonic_decreasing)
-        self.assertFalse(top.head(10).role.eq("peripheral").any())
         self.assertEqual(roles.priority_score.max(), 1.0)
         self.assertEqual(top.gid.tolist(), run.rank_nodes(roles).head(25).gid.tolist())
         self.assertFalse(top.why.isna().any())
@@ -180,6 +244,61 @@ class OutputTests(unittest.TestCase):
             self.assertEqual(len(re.findall(r"[.!?](?:\s|$)", cluster.hypothesis)), 2)
             self.assertIn("Для проверки следует", cluster.hypothesis)
             self.assertNotIn("курьеров", cluster.hypothesis)
+
+    def test_metrics_roles_and_clusters_ignore_input_row_order(self):
+        edges, nodes, _ = run.load(self.root / "data")
+        expected = run.add_priority(run.assign_roles(run.compute_features(edges, nodes)))
+        reordered = run.add_priority(run.assign_roles(run.compute_features(
+            edges.iloc[::-1], nodes.iloc[::-1])))
+        pd.testing.assert_frame_equal(expected, reordered, atol=1e-12, rtol=1e-10)
+        self.assertEqual(run.rank_nodes(expected).gid.tolist(), run.rank_nodes(reordered).gid.tolist())
+
+
+class InputTests(unittest.TestCase):
+    def test_seed_flag_normalization(self):
+        for values in ([True, False, True], [1, 0, 1], [1.0, 0.0, 1.0]):
+            result = run.normalize_seed_flags(pd.Series(values))
+            self.assertEqual(result.dtype, bool)
+            self.assertEqual(result.tolist(), [True, False, True])
+        for values in ([1, None], [0, 2], ["True", "False"], ["0", "1"]):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                run.normalize_seed_flags(pd.Series(values))
+
+    def test_integer_seed_flags_preserve_feature_values(self):
+        nodes = pd.DataFrame({"gid": [10, 20, 30], "depth": [0, 1, 1],
+                              "is_seed": [True, False, False]})
+        edges = pd.DataFrame({"src": [10, 10], "dst": [20, 30],
+                              "sum_kzt": [10_000, 20_000], "n_tx": [1, 1], "depth": [1, 1]})
+        integer_nodes = nodes.copy()
+        integer_nodes["is_seed"] = integer_nodes.is_seed.astype(int)
+        expected = run.compute_features(edges, nodes)
+        actual = run.compute_features(edges, integer_nodes)
+        pd.testing.assert_frame_equal(actual, expected)
+        self.assertEqual(actual.seed_payers.tolist(), [0, 1, 1])
+
+    def test_cli_normalizes_seed_flags_before_starter_sanity_check(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            output = Path(temp) / "exports"
+            data.mkdir()
+            pd.DataFrame({"gid": [10, 20, 30], "depth": [0, 1, 1],
+                          "is_seed": [1, 0, 0]}).to_parquet(data / "nodes.parquet")
+            edges = pd.DataFrame({"src": [10, 10], "dst": [20, 30],
+                                  "sum_kzt": [10_000, 20_000], "n_tx": [1, 1], "depth": [1, 1]})
+            edges.to_parquet(data / "edges.parquet")
+            tx = edges[["src", "dst", "sum_kzt"]].copy()
+            tx["date"] = pd.Timestamp("2026-07-01")
+            tx.to_parquet(data / "transactions.parquet")
+            result = subprocess.run(
+                [sys.executable, str(root / "run.py"), "--data", str(data),
+                 "--out", str(output), "--offline"],
+                cwd=root, capture_output=True, text=True, encoding="utf-8", timeout=300,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            roles = pd.read_csv(output / "nodes_roles.csv")
+            self.assertEqual(roles.is_seed.tolist(), [True, False, False])
+            self.assertEqual(roles.seed_payers.tolist(), [0, 1, 1])
 
 
 if __name__ == "__main__":

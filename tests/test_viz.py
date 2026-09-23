@@ -64,9 +64,47 @@ class VisualizationTests(unittest.TestCase):
         data = viz.build_data(self.nodes, self.edges, self.top, cluster="0")
         self.assertEqual(data["overviewIds"], self.ids[:2])
         self.assertEqual(data["initialMode"], "overview")
+        self.assertIn(data["initialGid"], data["overviewIds"])
+        self.assertEqual(data["initialGid"], self.ids[0])
         for kwargs in ({"gid": "missing"}, {"cluster": "missing"}):
             with self.assertRaises(ValueError):
                 viz.build_data(self.nodes, self.edges, self.top, **kwargs)
+
+    def test_cluster_without_top_nodes_uses_its_highest_priority_node(self):
+        self.nodes.loc[self.nodes.gid.isin(self.ids[-2:]), "cluster_id"] = "isolated-group"
+        self.nodes.loc[self.nodes.gid.eq(self.ids[-1]), "priority_score"] = 0.99
+        data = viz.build_data(self.nodes, self.edges, self.top, cluster="isolated-group")
+        self.assertEqual(data["initialGid"], self.ids[-1])
+        self.assertIn(data["initialGid"], data["overviewIds"])
+        self.assertNotIn(data["initialGid"], self.top.gid.tolist())
+
+    def test_incomplete_incoming_and_rule_are_preserved_for_card(self):
+        self.nodes["role_rule"] = "transit"
+        self.nodes["incoming_incomplete"] = False
+        self.nodes.loc[1, ["role_rule", "incoming_incomplete"]] = ["transit_missing_incoming", True]
+        self.nodes.loc[1, ["in_kzt", "out_kzt"]] = [100, 300]
+        data = viz.build_data(self.nodes, self.edges, self.top)
+        missing = data["nodes"][1]
+        self.assertTrue(missing["incoming_incomplete"])
+        self.assertEqual(missing["role_rule"], "transit_missing_incoming")
+        self.assertFalse(data["nodes"][2]["incoming_incomplete"])
+
+    def test_imported_coverage_flags_survive_loading_and_html_serialization(self):
+        self.nodes["depth"] = 0
+        for field in ("depth_known", "outgoing_coverage_known", "seed_incoming_incomplete", "incoming_incomplete"):
+            self.nodes[field] = "false"
+        with tempfile.TemporaryDirectory() as directory:
+            nodes_path, edges_path, top_path = self.write_inputs(directory)
+            nodes, edges = viz.load_data(nodes_path, edges_path)
+            top = viz.load_top(top_path, nodes)
+            data = viz.build_data(nodes, edges, top)
+            serialized = json.loads(re.search(r"const DATA = (.*);", viz.build_html(data)).group(1))
+        imported_seed = next(node for node in serialized["nodes"] if node["id"] == self.ids[0])
+        self.assertIs(imported_seed["is_seed"], True)
+        self.assertEqual(imported_seed["depth"], 0)
+        for field in ("depth_known", "outgoing_coverage_known", "seed_incoming_incomplete", "incoming_incomplete"):
+            with self.subTest(field=field):
+                self.assertIs(imported_seed[field], False)
 
     def test_funnel_ranked_queue_and_initial_node_come_from_data(self):
         data = viz.build_data(self.nodes, self.edges, self.top)
@@ -117,6 +155,7 @@ class VisualizationTests(unittest.TestCase):
         self.assertEqual(sum(edge["n_tx"] for edge in parsed["edges"]), int(self.edges.n_tx.sum()))
 
     def test_loading_preserves_gid_booleans_and_sums_both_edge_metrics(self):
+        self.nodes["incoming_incomplete"] = ["true", "1"] + ["false"] * 53
         with tempfile.TemporaryDirectory() as directory:
             nodes_path, edges_path, top_path = self.write_inputs(directory)
             pd.concat([self.edges, self.edges]).to_parquet(edges_path, index=False)
@@ -125,6 +164,7 @@ class VisualizationTests(unittest.TestCase):
         self.assertEqual(nodes.gid.tolist(), self.ids)
         self.assertEqual(nodes.is_seed.tolist(), [True] + [False] * 54)
         self.assertFalse(nodes.truncated_by_depth.any())
+        self.assertEqual(nodes.incoming_incomplete.tolist(), [True, True] + [False] * 53)
         self.assertEqual(len(edges), len(self.edges))
         self.assertEqual(edges.sum_kzt.sum(), 2 * self.edges.sum_kzt.sum())
         self.assertEqual(edges.n_tx.sum(), 2 * self.edges.n_tx.sum())
@@ -135,7 +175,7 @@ class VisualizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.dict(os.environ, {"OPENAI_API_KEY": ""}), \
                 patch.object(llm_layer, "OpenAI") as api:
-            hints = viz.collect_hints(self.nodes, self.edges, self.top, directory)
+            hints = viz.collect_hints(self.nodes, self.edges, self.top, directory, offline=True)
             data = viz.build_data(self.nodes, self.edges, self.top, hints=hints)
         api.assert_not_called()
         self.assertEqual(set(data["hints"]), set(self.top.gid))
@@ -146,7 +186,7 @@ class VisualizationTests(unittest.TestCase):
         with patch.object(viz, "LLMLayer") as layer:
             layer.return_value.node_hints.return_value = expected
             hints = viz.collect_hints(self.nodes, self.edges, self.top, "unused")
-        layer.assert_called_once_with("unused", timeout_seconds=10.0, budget_seconds=10.0)
+        layer.assert_called_once_with("unused", timeout_seconds=10.0, budget_seconds=10.0, offline=False)
         layer.return_value.node_hints.assert_called_once()
         payloads = layer.return_value.node_hints.call_args.args[0]
         self.assertEqual([payload["node"]["gid"] for payload in payloads], self.top.gid.tolist())

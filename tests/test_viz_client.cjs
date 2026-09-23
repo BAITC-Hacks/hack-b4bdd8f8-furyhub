@@ -4,11 +4,34 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const os = require('node:os');
+const {execFileSync} = require('node:child_process');
 
-const html = fs.readFileSync(path.join(__dirname, '../out/graph.html'), 'utf8');
+function readHtml() {
+    if (process.argv[2]) return fs.readFileSync(path.resolve(process.argv[2]), 'utf8');
+    const root = path.resolve(__dirname, '..');
+    const localPython = path.join(root, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
+    const python = process.env.PYTHON || (fs.existsSync(localPython) ? localPython : 'python');
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'furyhub-viz-test-'));
+    const output = path.join(directory, 'graph.html');
+    try {
+        execFileSync(python, ['-B', 'viz.py', '--no-llm', '--output', output], {
+            cwd: root, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024,
+        });
+        return fs.readFileSync(output, 'utf8');
+    } finally {
+        if (fs.existsSync(output)) fs.unlinkSync(output);
+        fs.rmdirSync(directory);
+    }
+}
+
+// По умолчанию проверяем свежий viz.py, не сохранённый артефакт в out/.
+// Для отдельного HTML: node tests/test_viz_client.cjs /path/to/graph.html.
+const html = readHtml();
 const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)];
+assert.ok(scripts.length, 'В HTML отсутствует клиентский JavaScript');
 const script = scripts.at(-1)[1];
-assert.match(script, /const DATA\s*=/, 'Сгенерируйте новый out/graph.html: python viz.py');
+assert.match(script, /const DATA\s*=/, 'HTML должен быть собран актуальным viz.py');
 
 class Element {
     constructor(tag = 'div') {
@@ -109,7 +132,10 @@ class DataSet {
 }
 
 class Network {
-    constructor(container, data, options) { this.events = {}; this.options = options; this.scale = 1.2; }
+    constructor(container, data, options) {
+        assert.ok(container, 'В HTML отсутствует контейнер графа');
+        this.events = {}; this.options = options; this.scale = 1.2;
+    }
     unselectAll() { this.selection = []; }
     fit() { this.scale = 1.2; this.fitCalls = (this.fitCalls || 0) + 1; }
     getScale() { return this.scale; }
@@ -119,7 +145,7 @@ class Network {
     on(name, callback) { this.events[name] = callback; }
     once(name, callback) { callback(); }
     setOptions(options) { this.options = {...this.options, ...options}; }
-    redraw() {}
+    redraw() { this.redrawCalls = (this.redrawCalls || 0) + 1; }
 }
 
 function load(data) {
@@ -127,21 +153,25 @@ function load(data) {
     const document = {
         createElement(tag) { return new Element(tag); },
         createTextNode(text) { const node = new Element('#text'); node.textContent = text; return node; },
-        getElementById(id) {
-            if (!elements.has(id)) { const element = new Element(); element.id = id; elements.set(id, element); }
-            return elements.get(id);
-        },
+        getElementById(id) { return elements.get(id) || null; },
         querySelectorAll(selector) { return [...elements.values()].flatMap(element => element.querySelectorAll(selector)); },
     };
-    // Сохраняем реальные типы статических элементов, в частности кнопок и формы.
-    for (const match of html.matchAll(/<([a-z][\w-]*)\b[^>]*\bid="([^"]+)"[^>]*>/gi)) {
-        const element = document.getElementById(match[2]);
-        element.tagName = match[1].toUpperCase();
+    // Только реальные id из разметки: опечатка в клиенте должна падать, как в браузере.
+    const markup = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '');
+    for (const match of markup.matchAll(/<([a-z][\w-]*)\b[^>]*\bid="([^"]+)"[^>]*>/gi)) {
+        assert.ok(!elements.has(match[2]), `Повторный HTML id ${match[2]}`);
+        const element = new Element(match[1]);
+        element.id = match[2];
+        elements.set(element.id, element);
         element.hidden = /\bhidden(?:\s|>|=)/.test(match[0]);
-        const leaf = html.slice(match.index + match[0].length).match(new RegExp(`^([^<]*)</${match[1]}>`));
+        element.disabled = /\bdisabled(?:\s|>|=)/.test(match[0]);
+        const leaf = markup.slice(match.index + match[0].length).match(new RegExp(`^([^<]*)</${match[1]}>`));
         if (leaf) element.textContent = leaf[1];
     }
-    const context = vm.createContext({document, vis: {DataSet, Network}, console,
+    const messages = [];
+    const window = {location: {protocol: 'http:', origin: 'http://127.0.0.1:8765'},
+        parent: {postMessage: (message, origin) => messages.push({message, origin})}};
+    const context = vm.createContext({document, window, vis: {DataSet, Network}, console,
         navigator: {clipboard: {writeText: async () => {}}},
         requestAnimationFrame: callback => callback(), setTimeout: callback => callback(), clearTimeout() {},
     });
@@ -149,7 +179,7 @@ function load(data) {
     vm.runInContext(client, context, {filename: 'graph-client.js'});
     const evaluate = expression => vm.runInContext(expression, context);
     return {
-        evaluate, document, elements,
+        evaluate, document, elements, messages,
         get(id) { return document.getElementById(id); },
         submit(query) {
             document.getElementById('gid').value = query;
@@ -176,11 +206,13 @@ function fixture() {
     const nodes = ids.map((id, index) => ({
         id, gid: id, role: index === 0 ? 'coordinator' : 'transit',
         role_label: index === 0 ? roleLabels.coordinator : roleLabels.transit,
-        role_meaning: index === 0 ? 'связывает несколько групп, кандидат в организаторы' : 'пропускает деньги дальше, не удерживая',
+        role_meaning: index === 0 ? 'связность узла требует проверки' : 'входящие и исходящие потоки требуют сопоставления',
         color: index === 0 ? '#e15759' : '#4e9ee8', role_score: .66,
         priority_score: 1 - index / 100, evidence: 'Гипотеза: 3 перевода требуют проверки.',
         is_seed: index === 0, cluster_id: '2', depth: index === 0 ? 0 : 1,
-        truncated_by_depth: false, in_kzt: 0, out_kzt: 0, in_deg: 0, out_deg: 0,
+        truncated_by_depth: false, incoming_incomplete: index === 0,
+        role_rule: index === 0 ? 'coordinator' : 'transit',
+        in_kzt: 0, out_kzt: 0, in_deg: 0, out_deg: 0,
         in_tx: 0, out_tx: 0, x: index * 5, y: index * 3,
     }));
     const edges = [];
@@ -242,11 +274,18 @@ assert.ok(realData.nodes.length > 0);
 assert.ok(realData.nodes.every(node => typeof node.id === 'string'));
 assert.equal(new Set(realData.nodes.map(node => node.id.slice(-realData.shortLen))).size, realData.nodes.length);
 const first = [...realData.top].sort((a, b) => a.rank - b.rank)[0];
-assertSelected(real, first.gid);
-assertNeighborhood(real, first.gid);
+assertSelected(real, realData.initialGid);
+if (realData.initialMode === 'overview') {
+    assert.equal(real.mode(), 'overview');
+    assert.ok(real.canvas().get(realData.initialGid));
+} else {
+    assertNeighborhood(real, realData.initialGid);
+}
+if (!process.argv[2]) assertSelected(real, first.gid);
 assert.equal(real.queue().length, realData.top.length);
 assert.equal(real.queue()[0].dataset.gid, first.gid);
 assertNoTechnicalWords(real);
+assert.equal(real.document.getElementById('nonexistent-id'), null, 'Fake DOM не должен создавать отсутствующие элементы');
 
 // Угловые случаи не зависят от текущей контрольной выгрузки.
 const sample = fixture();
@@ -269,8 +308,74 @@ assert.equal(app.network().options.interaction.selectConnectedEdges, false);
 assert.equal(app.network().options.interaction.hoverConnectedEdges, false);
 assert.ok(app.network().scale <= .8);
 assert.equal(app.get('detail-why').textContent, sample.data.top[0].why);
-assert.match(app.get('detail-confidence').textContent, /66%/);
+assert.match(app.get('detail-confidence').textContent, /сила правила\s*0,66\s*\/\s*1/i);
+assert.doesNotMatch(app.get('detail-confidence').textContent, /уверенность/i);
 assert.equal(app.get('hints').hidden, false);
+
+// Полные списки доступны независимо от лимита соседей на canvas.
+const expanded = load(sample.data);
+for (const [target, expected] of [['payers', [...sample.incoming, ...sample.mutual]], ['recipients', [...sample.outgoing, ...sample.mutual]]]) {
+    assert.equal(expanded.get(target).querySelectorAll('button[data-gid]').length, 5);
+    const more = expanded.get(`${target}-more`);
+    assert.equal(more.tagName, 'BUTTON');
+    assert.equal(more.hidden, false);
+    more.click();
+    const shown = expanded.get(target).querySelectorAll('button[data-gid]').map(row => row.dataset.gid);
+    assert.deepEqual(new Set(shown), new Set(expected), 'Раскрытие должно показывать всех контрагентов');
+    assert.equal(more.hidden, true, 'После последней страницы кнопка скрыта');
+}
+const hiddenPayer = sample.incoming[1];
+assert.ok(!expanded.canvas().get(hiddenPayer), 'Мелкий плательщик остаётся за лимитом canvas');
+expanded.get('payers').querySelector(`[data-gid="${hiddenPayer}"]`).click();
+assertSelected(expanded, hiddenPayer);
+assertNeighborhood(expanded, hiddenPayer);
+
+const filtered = load(sample.data);
+for (const [target, gid] of [['payers', sample.incoming[1]], ['recipients', sample.outgoing[1]]]) {
+    const input = filtered.get(`${target}-filter`);
+    input.value = gid;
+    input.dispatch('input');
+    const rows = filtered.get(target).querySelectorAll('button[data-gid]');
+    assert.equal(rows.length, 1, 'Поиск проверяет полный список, включая скрытых на canvas соседей');
+    assert.equal(rows[0].dataset.gid, gid);
+    assert.equal(filtered.get(`${target}-more`).hidden, true);
+    input.value = 'not-a-gid';
+    input.dispatch('input');
+    assert.equal(filtered.get(target).querySelectorAll('button[data-gid]').length, 0);
+    assert.match(filtered.get(target).textContent, /совпадений нет/i);
+    input.value = '';
+    input.dispatch('input');
+    assert.equal(filtered.get(target).querySelectorAll('button[data-gid]').length, 5);
+}
+
+const incomplete = load({...sample.data, initialGid: sample.outside,
+    nodes: sample.data.nodes.map(node => node.id === sample.outside ? {...node, incoming_incomplete: true} : node)});
+assert.match(incomplete.get('badges').textContent, /неполный видимый вход/i);
+assert.match(incomplete.get('caveats').textContent, /не подтверждает транзит/i);
+
+// Возврат между карточками обзора должен сбрасывать поиск и страницу контрагентов.
+const historySample = fixture();
+const historyNodes = new Map(historySample.data.nodes.map(node => [node.id, node]));
+historySample.outgoing.forEach((id, index) => {
+    historySample.data.edges.push({id: `history-${index}`, from: historySample.outside, to: id, sum_kzt: 1000, n_tx: 1});
+    const source = historyNodes.get(historySample.outside), target = historyNodes.get(id);
+    source.out_kzt += 1000; source.out_tx++; source.out_deg++;
+    target.in_kzt += 1000; target.in_tx++; target.in_deg++;
+});
+const restored = load({...historySample.data, initialMode: 'overview'});
+restored.network().events.click({nodes: [historySample.outside]});
+const recipientFilter = restored.get('recipients-filter');
+recipientFilter.value = historySample.outside.slice(0, 8);
+recipientFilter.dispatch('input');
+assert.equal(restored.get('recipients-more').hidden, false);
+restored.get('recipients-more').click();
+assert.ok(restored.get('recipients').querySelectorAll('button[data-gid]').length > 5);
+restored.get('back').click();
+assertSelected(restored, historySample.center);
+assert.equal(restored.mode(), 'overview');
+assert.equal(recipientFilter.value, '', 'Назад к другому клиенту очищает фильтр его контрагентов');
+assert.equal(restored.get('recipients').querySelectorAll('button[data-gid]').length, 5, 'Назад к другому клиенту возвращает первую страницу');
+assert.equal(restored.get('recipients-more').hidden, false);
 
 const second = app.queue()[1];
 assert.equal(second.tagName, 'BUTTON', 'Нативная кнопка поддерживает Enter без собственного keydown');
@@ -314,6 +419,13 @@ assert.equal(app.mode(), 'overview');
 assert.equal(app.get('directions').hidden, true);
 assert.equal(app.canvas().length, sample.data.overviewIds.length);
 assert.match(app.get('overview').textContent, /К окружению/);
+const reciprocal = app.edges().get().filter(edge =>
+    (edge.from === sample.center && edge.to === sample.mutual[0]) ||
+    (edge.to === sample.center && edge.from === sample.mutual[0]));
+assert.equal(reciprocal.length, 2);
+assert.ok(reciprocal.every(edge => edge.smooth && edge.smooth.enabled), 'Встречные потоки в обзоре должны идти разными дугами');
+const oneWay = app.edges().get().find(edge => edge.from === sample.incoming[0] && edge.to === sample.center);
+assert.ok(!oneWay.smooth || !oneWay.smooth.enabled, 'Одностороннему потоку дуга не нужна');
 app.network().events.click({nodes: [sample.center]});
 assertSelected(app, sample.center);
 assert.equal(app.mode(), 'overview', 'Один клик в обзоре меняет только карточку');
@@ -347,4 +459,89 @@ const cluster = load({...sample.data, initialMode: 'overview', overviewIds: [sam
 assert.equal(cluster.mode(), 'overview');
 assert.equal(cluster.canvas().length, 2);
 assert.equal(cluster.get('directions').hidden, true);
-console.log('OK: real HTML, rank 1, queue/Enter button, back, full/suffix search, errors, isolated, overview, neighbor, limits, directions, safe Russian UI.');
+assert.ok(cluster.canvas().get(cluster.current()), 'Выбранная карточка должна присутствовать в кластере');
+
+// Фокус уменьшает визуальный шум, сохраняя все узлы и переводы обзора.
+const overview = load({...sample.data, initialMode: 'overview'});
+const overviewNodeIds = new Set(overview.canvas().getIds());
+const overviewEdgeIds = new Set(overview.edges().getIds());
+const payloadBeforeFocus = overview.evaluate('JSON.stringify(DATA)');
+function overviewZoom(scale) {
+    overview.network().moveTo({scale});
+    overview.network().events.zoom({scale});
+}
+overviewZoom(.2);
+assert.ok(overview.canvas().get(sample.center).label, 'При отдалении у лидера очереди остаётся подпись');
+assert.equal(overview.canvas().get(sample.outgoing[0]).label, '', 'Мелкие подписи скрыты в общем плане');
+assert.ok(overview.edges().get().every(edge => edge.color.opacity < .25), 'Без фокуса связи служат фоном');
+overviewZoom(.8);
+assert.ok(overview.canvas().get(sample.outgoing[0]).label, 'При приближении появляются остальные подписи');
+overviewZoom(.2);
+overview.network().events.click({nodes: [sample.center]});
+assertSelected(overview, sample.center);
+assert.deepEqual(new Set(overview.canvas().getIds()), overviewNodeIds);
+assert.deepEqual(new Set(overview.edges().getIds()), overviewEdgeIds);
+const directNeighbors = [...sample.incoming, ...sample.outgoing, ...sample.mutual];
+assert.ok(overview.canvas().get(sample.center).label);
+assert.equal(directNeighbors.filter(gid => overview.canvas().get(gid).label).length, 12, 'Издалека подписаны только крупнейшие соседи');
+assert.ok(overview.canvas().get(sample.mutual[6]).label, 'Крупный встречный поток входит в подписи общего плана');
+assert.equal(overview.canvas().get(sample.incoming[0]).label, '', 'Мелкий сосед не загромождает общий план');
+assert.ok(directNeighbors.every(gid => overview.canvas().get(gid).opacity === 1), 'Подсветка сохраняет всех соседей даже без подписи');
+overviewZoom(.8);
+for (const gid of [sample.center, ...sample.incoming, ...sample.outgoing, ...sample.mutual]) {
+    assert.ok(overview.canvas().get(gid).label, 'Вблизи подписаны выбранный клиент и все прямые соседи');
+    assert.equal(overview.canvas().get(gid).opacity, 1);
+}
+for (const gid of [sample.outside, sample.isolated]) {
+    assert.equal(overview.canvas().get(gid).label, '', 'Клиент за пределами прямого окружения не получает подпись');
+    assert.equal(overview.canvas().get(gid).opacity, .22);
+}
+const focusedIncoming = overview.edges().get().find(edge => edge.from === sample.incoming[0] && edge.to === sample.center);
+const focusedOutgoing = overview.edges().get().find(edge => edge.from === sample.center && edge.to === sample.outgoing[0]);
+assert.notEqual(focusedIncoming.color.color, focusedOutgoing.color.color, 'Входящие и исходящие различаются цветом');
+for (const edge of overview.edges().get()) {
+    const incident = edge.from === sample.center || edge.to === sample.center;
+    assert.equal(edge.color.opacity, incident ? .95 : .08, 'Яркость выделяет только связи выбранного клиента');
+}
+assert.equal(overview.evaluate('JSON.stringify(DATA)'), payloadBeforeFocus, 'Фокус не меняет исходные данные');
+
+overviewZoom(.2);
+overview.network().events.click({nodes: []});
+assert.equal(overview.mode(), 'overview');
+assertSelected(overview, sample.center);
+assert.ok(overview.canvas().get().every(node => node.opacity === 1), 'Пустой клик снимает затенение узлов');
+assert.ok(overview.edges().get().every(edge => edge.color.opacity < .25));
+assert.equal(overview.canvas().get(sample.outgoing[0]).label, '');
+assert.deepEqual(new Set(overview.canvas().getIds()), overviewNodeIds);
+
+// При возврате из окружения обзор открывается без оставшегося фокуса.
+overview.network().events.click({nodes: [sample.center]});
+overview.get('overview').click();
+assertNeighborhood(overview, sample.center);
+overview.get('back').click();
+assert.equal(overview.mode(), 'overview');
+assert.ok(overview.canvas().get().every(node => node.opacity === 1));
+assert.ok(overview.edges().get().every(edge => edge.color.opacity < .25));
+assert.deepEqual(new Set(overview.canvas().getIds()), overviewNodeIds);
+
+for (const id of ['zoom-in', 'zoom-out', 'fit-view']) assert.equal(overview.get(id).tagName, 'BUTTON');
+const beforeZoom = overview.network().getScale();
+overview.get('zoom-in').click();
+assert.ok(overview.network().getScale() > beforeZoom);
+const afterZoom = overview.network().getScale();
+overview.get('zoom-out').click();
+assert.ok(overview.network().getScale() < afterZoom);
+for (let index = 0; index < 30; index++) overview.get('zoom-in').click();
+assert.ok(overview.network().getScale() <= 2.5, 'Увеличение имеет верхний предел');
+for (let index = 0; index < 60; index++) overview.get('zoom-out').click();
+assert.ok(overview.network().getScale() >= .06, 'Уменьшение имеет нижний предел');
+const fitsBefore = overview.network().fitCalls;
+overview.get('fit-view').click();
+assert.ok(overview.network().fitCalls > fitsBefore, 'Кнопка обзора подгоняет граф к экрану');
+assert.deepEqual(new Set(overview.canvas().getIds()), overviewNodeIds);
+assert.deepEqual(new Set(overview.edges().getIds()), overviewEdgeIds);
+assert.equal(overview.evaluate('JSON.stringify(DATA)'), payloadBeforeFocus);
+assert.equal(overview.messages.at(-1).message.type, 'furyhub:node-selected');
+assert.equal(overview.messages.at(-1).message.gid, overview.current());
+assert.equal(overview.messages.at(-1).origin, 'http://127.0.0.1:8765');
+console.log('OK: fresh HTML, strict DOM, navigation, search, cluster, reciprocal flows, complete peers, overview focus/zoom, safe Russian UI.');

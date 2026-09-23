@@ -6,6 +6,7 @@ Every API client is replaced with a mock; no test contacts OpenAI.
 from contextlib import contextmanager
 from copy import deepcopy
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -75,6 +76,21 @@ def completed_response(request, choose_last=False):
         status="completed", output_text=json.dumps(schema_selection(request, choose_last)),
         output=[],
     )
+
+
+def write_cluster_in_process(out_dir, cluster_id, ready, start):
+    layer = llm_layer.LLMLayer(out_dir, model="test-model", offline=True)
+    ready.set()
+    if not start.wait(10):
+        raise TimeoutError("Test start signal missing")
+    layer.hypotheses([cluster_payload(cluster_id)])
+
+
+def hold_cache_lock_in_process(path, ready, release):
+    with llm_layer._cache_lock(Path(path)):
+        ready.set()
+        if not release.wait(10):
+            raise TimeoutError("Test release signal missing")
 
 
 class LLMLayerTests(unittest.TestCase):
@@ -265,6 +281,39 @@ class LLMLayerTests(unittest.TestCase):
         self.assertIn("0", isolated)
         self.assertNotIn("nan", isolated.lower())
 
+    def test_imported_seed_does_not_imply_truncated_incoming_or_known_depth(self):
+        original = node_payload(
+            role="peripheral", role_rule="other", is_seed=True, depth=0,
+            depth_known=False, outgoing_coverage_known=False,
+            seed_incoming_incomplete=False, incoming_incomplete=False,
+        )["node"]
+        nodes = pd.DataFrame([original])
+        edges = pd.DataFrame(columns=["src", "dst", "sum_kzt", "n_tx"])
+        payload = llm_layer.node_payload(nodes, edges, GID)
+        for field in ("depth_known", "outgoing_coverage_known", "seed_incoming_incomplete"):
+            self.assertIs(payload["node"][field], False)
+        with patch.object(llm_layer, "OpenAI") as constructor:
+            card = llm_layer.LLMLayer(self.root / "imported", offline=True).node_card(payload)
+        constructor.assert_not_called()
+        self.assertIn("полнота исходящих неизвестна", card)
+        self.assertIn("Глубина обхода не предоставлена", card)
+        self.assertNotIn("занижены", card)
+        self.assertNotIn("обход обрезан", card)
+        self.assertNotRegex(card.lower(), r"глубин[аеы] 0|0-й шаг")
+
+    def test_imported_cluster_caveat_uses_declared_coverage_not_seed_membership(self):
+        data = cluster_payload()
+        data["seed_incoming_incomplete"] = False
+        data["outgoing_coverage_known"] = False
+        data["top_nodes"][0].update(depth_known=False, outgoing_coverage_known=False,
+                                     seed_incoming_incomplete=False, incoming_incomplete=False)
+        layer = llm_layer.LLMLayer(self.root / "imported-cluster", offline=True)
+        text = layer.hypotheses([data])[0]
+        self.assert_hypothesis(text)
+        self.assertIn("seed — 1", text)
+        self.assertIn("полнота исходящих неизвестна", text)
+        self.assertNotIn("занижены", text)
+
     def test_node_uses_structured_output_and_caches(self):
         with self.api() as (_, create):
             first = self.layer().node_card(node_payload())
@@ -370,6 +419,12 @@ class LLMLayerTests(unittest.TestCase):
         self.assertIn(GID, first)
         self.assertIn(OTHER_GID, first)
         create.assert_not_called()
+        with patch.object(llm_layer, "dotenv_values") as dotenv, \
+                patch.object(llm_layer, "OpenAI") as constructor:
+            offline = llm_layer.explain_node(GID, data_dir=data, out_dir=out, offline=True)
+        self.assertEqual(offline, first)
+        dotenv.assert_not_called()
+        constructor.assert_not_called()
 
 
     def test_overall_budget_stops_new_requests_after_expiry(self):
@@ -418,6 +473,138 @@ class LLMLayerTests(unittest.TestCase):
             result = self.layer().hypotheses([cluster_payload()])
         self.assertEqual(create.call_count, 1)
         self.assert_hypothesis(result[0])
+
+    def test_offline_skips_dotenv_api_key_and_client_but_uses_valid_cache(self):
+        with self.api():
+            expected = self.layer().hypotheses([cluster_payload()])
+        with patch.object(llm_layer, "dotenv_values") as dotenv, \
+                patch.object(llm_layer, "OpenAI") as constructor, \
+                patch.dict(os.environ, {"OPENAI_API_KEY": "must-not-be-used"}):
+            layer = llm_layer.LLMLayer(self.root / "out", model="test-model", offline=True)
+            actual = layer.hypotheses([cluster_payload()])
+            layer.hypotheses([cluster_payload(1)])
+        self.assertEqual(actual, expected)
+        self.assertEqual(layer._key, "")
+        dotenv.assert_not_called()
+        constructor.assert_not_called()
+
+    def test_stale_instance_cannot_overwrite_fresh_llm_with_fallback(self):
+        old = llm_layer.LLMLayer(self.root / "out", model="test-model", offline=True)
+        with self.api(create=lambda **kwargs: completed_response(kwargs, choose_last=True)):
+            expected = self.layer().hypotheses([cluster_payload()])
+        old.hypotheses([cluster_payload()])
+        cache = json.loads(old.cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(next(iter(cache["entries"].values()))["source"], "llm")
+        self.assertEqual(old.hypotheses([cluster_payload()]), expected)
+
+    def test_stale_snapshot_only_writes_changed_keys(self):
+        with self.api(key=False):
+            self.layer().hypotheses([cluster_payload()])
+            old = self.layer()
+        with self.api():
+            self.layer().hypotheses([cluster_payload()])
+        old.hypotheses([cluster_payload(1)])
+        cache = json.loads(old.cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(cache["entries"]), 2)
+        self.assertEqual(sorted(entry["source"] for entry in cache["entries"].values()),
+                         ["fallback", "llm"])
+
+    def test_parallel_process_writes_preserve_both_clusters(self):
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        workers = []
+        try:
+            for cluster_id in range(2):
+                ready = context.Event()
+                process = context.Process(target=write_cluster_in_process,
+                    args=(str(self.root / "out"), cluster_id, ready, start))
+                process.start()
+                workers.append((process, ready))
+            self.assertTrue(all(ready.wait(10) for _, ready in workers))
+            start.set()
+            for process, _ in workers:
+                process.join(10)
+                self.assertEqual(process.exitcode, 0)
+        finally:
+            start.set()
+            for process, _ in workers:
+                if process.is_alive():
+                    process.terminate()
+                process.join(10)
+        cache = json.loads((self.root / "out/llm_cache.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(cache["entries"]), 2)
+
+    def test_busy_process_lock_returns_report_and_keeps_pending_cache(self):
+        context = multiprocessing.get_context("spawn")
+        ready, release = context.Event(), context.Event()
+        out = self.root / "out"
+        out.mkdir()
+        process = context.Process(target=hold_cache_lock_in_process,
+            args=(str(out / "llm_cache.json.lock"), ready, release))
+        process.start()
+        lock = llm_layer._cache_lock
+        layer = llm_layer.LLMLayer(out, model="test-model", offline=True)
+        try:
+            self.assertTrue(ready.wait(10))
+            with patch.object(llm_layer, "_cache_lock",
+                              side_effect=lambda path: lock(path, timeout=0.05)):
+                self.assert_hypothesis(layer.hypotheses([cluster_payload()])[0])
+            self.assertTrue(layer._dirty)
+        finally:
+            release.set()
+            process.join(10)
+            if process.is_alive():
+                process.terminate()
+                process.join(10)
+        self.assertEqual(process.exitcode, 0)
+        layer._save_cache()
+        self.assertFalse(layer._dirty)
+        self.assertTrue(layer.cache_path.exists())
+
+    def test_cluster_fallback_requires_dominant_share_of_all_nodes(self):
+        data = cluster_payload()
+        data["n_nodes"] = 100
+        cases = [
+            ({"coordinator": 1, "terminal": 59, "peripheral": 40}, "unknown"),
+            ({"coordinator": 1, "terminal": 60, "peripheral": 39}, "terminal"),
+            ({"consolidator": 50, "terminal": 50}, "unknown"),
+            ({"coordinator": 1, "peripheral": 99}, "unknown"),
+        ]
+        for counts, expected in cases:
+            with self.subTest(counts=counts):
+                data["role_counts"] = counts
+                layer = llm_layer.LLMLayer(self.root / "out", offline=True)
+                text = layer.hypotheses([data])[0]
+                self.assertIn(llm_layer.PURPOSES[expected], text)
+                self.assert_hypothesis(text)
+
+    def test_missing_incoming_is_not_interpreted_as_transit(self):
+        for changes in ({"incoming_incomplete": True}, {"role_rule": "missing_incoming"},
+                        {"role_rule": "transit_missing_incoming"}):
+            with self.subTest(changes=changes):
+                data = node_payload(role="peripheral", is_seed=False, **changes)
+                layer = llm_layer.LLMLayer(self.root / "out", offline=True)
+                hints = layer.node_hints([data])[0]
+                self.assertEqual(hints["next_request"], llm_layer.REQUESTS["incoming"])
+                self.assertIn("недостаточно", hints["attention"])
+                card = layer.node_card(data)
+                self.assertIn("не подтверждает транзит", card)
+
+    def test_missing_numeric_values_are_reported_without_inventing_zero(self):
+        layer = llm_layer.LLMLayer(self.root / "out", offline=True)
+        data = node_payload(priority_score=float("nan"), in_kzt=float("nan"),
+                            in_deg=float("nan"), pass_through=float("nan"))
+        card = layer.node_card(data)
+        self.assertIn("приоритет нет данных", card)
+        self.assertIn("вход нет данных", card)
+        self.assertNotIn("при нулевом входе", card)
+        cluster = cluster_payload()
+        cluster.update(sum_kzt_internal=float("nan"), turnover_share=float("inf"))
+        hypothesis = layer.hypotheses([cluster])[0]
+        self.assertIn("внутренние переводы нет данных", hypothesis)
+        self.assertIn("доля общего оборота (вход + выход) — нет данных", hypothesis)
+        self.assert_hypothesis(hypothesis)
+        self.assertNotIn("nan", (card + hypothesis).lower())
 
 if __name__ == "__main__":
     unittest.main()

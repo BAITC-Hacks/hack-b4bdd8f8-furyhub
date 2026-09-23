@@ -6,6 +6,7 @@
 формат JSON, но и суммы, идентификаторы и отсутствующие атрибуты клиентов.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
@@ -14,6 +15,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from time import monotonic
 
 try:
@@ -32,6 +34,8 @@ TIMEOUT_SECONDS = 30.0
 LLM_BUDGET_SECONDS = 120.0
 BATCH_SIZE = 25
 CACHE_VERSION = 1
+CACHE_LOCK_SECONDS = 2.0
+THRESHOLDS = {"cluster_dominant_role_share": 0.60}
 ROLES = ("consolidator", "transit", "distributor", "terminal", "coordinator", "peripheral")
 PURPOSES = {
     "consolidator": "возможная консолидация средств",
@@ -106,21 +110,51 @@ def _cluster_options(data):
     return {"purpose": purposes, "next_request": requests}
 
 
+def _fallback_selection(kind, data, options):
+    selection = {field: next(iter(choices)) for field, choices in options.items()}
+    if kind == "cluster":
+        # Назначение группы выводим только из роли не менее 60% всех её узлов.
+        # Периферийные узлы тоже входят в знаменатель и не задают назначение.
+        counts = data["role_counts"]
+        dominant = max(ROLES, key=lambda role: counts.get(role, 0) or 0)
+        n_nodes = data["n_nodes"]
+        share = (counts.get(dominant, 0) or 0) / n_nodes if n_nodes else 0.0
+        selection["purpose"] = (
+            dominant if dominant in options["purpose"]
+            and share >= THRESHOLDS["cluster_dominant_role_share"] else "unknown"
+        )
+    return selection
+
+
+def _incoming_incomplete(node):
+    return bool(node.get("incoming_incomplete") or node.get("seed_incoming_incomplete", node.get("is_seed"))
+                or node.get("role_rule") in ("missing_incoming", "transit_missing_incoming"))
+
+
+def _number(value, spec=""):
+    # Отсутствующее/нечисловое значение не подменяется нулём в отчёте.
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return "нет данных"
+    return format(value, spec)
+
+
 def _money(value):
-    return f"{value:,.2f}".replace(",", " ")
+    return _number(value, ",.2f").replace(",", " ")
 
 
 def _render_cluster(data, selection, options):
-    composition = ", ".join(f"{role} — {data['role_counts'].get(role, 0)}" for role in ROLES)
-    caveat = ("связь с делом не подтверждена"
-              if data["n_seed"] == 0 else "у seed входящие занижены методом сбора")
+    composition = ", ".join(f"{role} — {_number(data['role_counts'].get(role, 0))}" for role in ROLES)
+    caveat = ("у seed входящие занижены методом сбора"
+              if data.get("seed_incoming_incomplete", data["n_seed"] > 0)
+              else "полнота исходящих неизвестна" if not data.get("outgoing_coverage_known", True)
+              else "связь с делом не подтверждена")
     # Ровно два предложения; все числовые вставки получены из агрегатов.
     return (
         f"Гипотеза для проверки: {options['purpose'][selection['purpose']]}; "
-        f"группа из {data['n_nodes']} узлов, seed — {data['n_seed']}; роли: {composition}; "
+        f"группа из {_number(data['n_nodes'])} узлов, seed — {_number(data['n_seed'])}; роли: {composition}; "
         f"внутренние переводы {_money(data['sum_kzt_internal'])} KZT; "
         f"оборот (вход + выход) — {_money(data['turnover_kzt'])} KZT; "
-        f"доля общего оборота (вход + выход) — {data['turnover_share']:.2%}. "
+        f"доля общего оборота (вход + выход) — {_number(data['turnover_share'], '.2%')}. "
         f"Для проверки следует {options['next_request'][selection['next_request']]}; "
         f"{caveat}; назначение платежей и общая принадлежность узлов не установлены."
     )
@@ -133,11 +167,12 @@ def _node_options(data):
     if node["truncated_by_depth"]:
         attention["truncated"] = "отсутствие видимого выхода может быть следствием границы обхода"
         requests["outgoing"] = REQUESTS["outgoing"]
-    if node["is_seed"] or node.get("role_rule") == "transit_missing_incoming":
+    if _incoming_incomplete(node):
         attention["incoming"] = "видимого входа может быть недостаточно для оценки баланса потоков"
         requests["incoming"] = REQUESTS["incoming"]
-    if node["in_deg"] + node["out_deg"]:
-        attention[node["role"]] = PURPOSES.get(node["role"], PURPOSES["unknown"])
+    if node["in_deg"] or node["out_deg"]:
+        if node["role"] != "transit" or not _incoming_incomplete(node):
+            attention[node["role"]] = PURPOSES.get(node["role"], PURPOSES["unknown"])
         requests["timing"] = REQUESTS["timing"]
     attention["coverage"] = "роль остаётся гипотезой по неполной выборке переводов"
     requests["payments"] = REQUESTS["payments"]
@@ -149,12 +184,13 @@ def _render_node(data, selection, options):
     lines = [
         f"Узел {node['gid']}",
         f"Роль по правилам: {node['role']} (гипотеза для проверки); "
-        f"приоритет {node['priority_score']:.6f}; кластер {node['cluster_id']}.",
-        f"Потоки: вход {_money(node['in_kzt'])} KZT, переводов {node['in_tx']}, "
-        f"плательщиков {node['in_deg']}; выход {_money(node['out_kzt'])} KZT, "
-        f"переводов {node['out_tx']}, получателей {node['out_deg']}.",
+        f"приоритет {_number(node['priority_score'], '.6f')}; кластер {node['cluster_id']}.",
+        f"Потоки: вход {_money(node['in_kzt'])} KZT, переводов {_number(node['in_tx'])}, "
+        f"плательщиков {_number(node['in_deg'])}; выход {_money(node['out_kzt'])} KZT, "
+        f"переводов {_number(node['out_tx'])}, получателей {_number(node['out_deg'])}.",
         "Отношение выхода ко входу: " + (
-            "не определено при нулевом входе."
+            ("не определено при нулевом входе." if node['in_kzt'] == 0
+             else "не определено: недостаточно данных.")
             if node.get("pass_through") is None else f"{node['pass_through']:.6f}."
         ),
     ]
@@ -162,15 +198,22 @@ def _render_node(data, selection, options):
                              ("outgoing", "Крупнейшие видимые получатели")):
         peers = data["counterparties"][direction]
         text = "; ".join(
-            f"gid {p['gid']} ({p['role']}): {_money(p['sum_kzt'])} KZT, переводов {p['n_tx']}"
+            f"gid {p['gid']} ({p['role']}): {_money(p['sum_kzt'])} KZT, переводов {_number(p['n_tx'])}"
             for p in peers
         ) or "нет видимых связей"
         lines.append(f"{label}: {text}.")
-    if node["is_seed"]:
+    if node.get("seed_incoming_incomplete", node["is_seed"]):
         lines.append("Ограничение: у seed входящие суммы занижены методом сбора.")
+    elif _incoming_incomplete(node):
+        lines.append("Ограничение: входящие переводы могут быть неполными; "
+                     "отношение выхода ко входу не подтверждает транзит.")
     if node["truncated_by_depth"]:
         lines.append(f"Ограничение: обход обрезан на глубине {node['depth']}; "
                      "нулевой выход не доказывает конечное получение средств.")
+    if not node.get("outgoing_coverage_known", True):
+        lines.append("Ограничение: полнота исходящих неизвестна; удержание средств и конечное получение не установлены.")
+    if not node.get("depth_known", True):
+        lines.append("Глубина обхода не предоставлена источником.")
     lines += [
         f"На что обратить внимание: {options['attention'][selection['attention']]}.",
         f"Следующий запрос: {options['next_request'][selection['next_request']]} "
@@ -179,14 +222,58 @@ def _render_node(data, selection, options):
     return "\n".join(lines)
 
 
+@contextmanager
+def _cache_lock(path, timeout=CACHE_LOCK_SECONDS):
+    """Блокировка ОС с ограниченным ожиданием; освобождается и при сбое процесса."""
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            if handle.seek(0, os.SEEK_END) == 0:
+                handle.write(b"\0")
+                handle.flush()
+
+            def acquire():
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+            def release():
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            def acquire():
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def release():
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                acquire()
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Истекло ожидание блокировки LLM-кеша") from None
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        try:
+            yield
+        finally:
+            release()
+
+
 class LLMLayer:
     """Один сеанс: общий бюджет API, circuit breaker и файловый кеш."""
 
     def __init__(self, out_dir="out", *, env_path=None, model=None,
-                 timeout_seconds=TIMEOUT_SECONDS, budget_seconds=LLM_BUDGET_SECONDS):
+                 timeout_seconds=TIMEOUT_SECONDS, budget_seconds=LLM_BUDGET_SECONDS,
+                 offline=False):
         self.cache_path = Path(out_dir) / "llm_cache.json"
+        self.offline = bool(offline)
         config = {}
-        if dotenv_values is not None:
+        if not self.offline and dotenv_values is not None:
             try:
                 config = dotenv_values(
                     Path(env_path) if env_path is not None else Path(__file__).with_name(".env")
@@ -194,9 +281,9 @@ class LLMLayer:
             except (OSError, UnicodeError):
                 LOGGER.warning("Не удалось прочитать .env; используется окружение или фолбэк.")
         self.model = model or os.environ.get("OPENAI_MODEL") or config.get("OPENAI_MODEL") or DEFAULT_MODEL
-        self._key = os.environ.get("OPENAI_API_KEY", config.get("OPENAI_API_KEY") or "")
+        self._key = "" if self.offline else os.environ.get("OPENAI_API_KEY", config.get("OPENAI_API_KEY") or "")
         self._cache = self._read_cache()
-        self._dirty = False
+        self._dirty = {}
         self._client = None
         self._failed = False
         self._deadline = None
@@ -219,16 +306,25 @@ class LLMLayer:
         temporary = None
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            entries = self._read_cache()
-            entries.update(self._cache)
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
-                                             dir=self.cache_path.parent,
-                                             prefix=".llm_cache_", suffix=".tmp") as handle:
-                temporary = Path(handle.name)
-                json.dump({"version": CACHE_VERSION, "entries": entries}, handle,
-                          ensure_ascii=False, sort_keys=True, allow_nan=False)
-            os.replace(temporary, self.cache_path)
-            self._dirty = False
+            with _cache_lock(self.cache_path.with_suffix(".json.lock")):
+                entries = self._read_cache()
+                for key, options in self._dirty.items():
+                    fresh, proposed = entries.get(key), self._cache[key]
+                    # Старый сеанс без API не должен вытеснять уже готовый ответ.
+                    if (proposed.get("source") != "llm" and isinstance(fresh, dict)
+                            and fresh.get("source") == "llm"
+                            and _valid_selection(fresh.get("selection"), options)):
+                        continue
+                    entries[key] = proposed
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
+                                                 dir=self.cache_path.parent,
+                                                 prefix=".llm_cache_", suffix=".tmp") as handle:
+                    temporary = Path(handle.name)
+                    json.dump({"version": CACHE_VERSION, "entries": entries}, handle,
+                              ensure_ascii=False, sort_keys=True, allow_nan=False)
+                os.replace(temporary, self.cache_path)
+                self._cache = entries
+                self._dirty.clear()
         except (OSError, ValueError):
             LOGGER.warning("Не удалось сохранить LLM-кеш; отчёт доступен без кеша.")
         finally:
@@ -244,7 +340,7 @@ class LLMLayer:
         return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
 
     def _request(self, kind, batch, options):
-        if self._failed or not self._key or OpenAI is None:
+        if self.offline or self._failed or not self._key or OpenAI is None:
             return None
         if self._deadline is None:
             self._deadline = monotonic() + self.budget_seconds
@@ -303,13 +399,13 @@ class LLMLayer:
                                            [options[i] for i in indexes])
                 for offset, i in enumerate(indexes):
                     selection = (generated[offset] if generated is not None else
-                                 {field: next(iter(choices)) for field, choices in options[i].items()})
+                                 _fallback_selection(kind, payloads[i], options[i]))
                     results[i] = selection
                     entry = {"source": "llm" if generated is not None else "fallback",
                              "selection": selection}
                     if self._cache.get(keys[i]) != entry:
                         self._cache[keys[i]] = entry
-                        self._dirty = True
+                        self._dirty[keys[i]] = options[i]
             self._save_cache()
         finally:
             if self._client is not None:
@@ -346,9 +442,9 @@ class LLMLayer:
         ]
 
 
-def cluster_hypothesis(aggregates, *, out_dir="out"):
+def cluster_hypothesis(aggregates, *, out_dir="out", offline=False):
     """Гипотеза по одному словарю агрегатов; для пайплайна лучше hypotheses()."""
-    return LLMLayer(out_dir).hypotheses([aggregates])[0]
+    return LLMLayer(out_dir, offline=offline).hypotheses([aggregates])[0]
 
 
 def node_payload(nodes, edges, gid):
@@ -365,7 +461,8 @@ def node_payload(nodes, edges, gid):
         raise ValueError(f"Узел gid={gid} не найден в nodes_roles.csv")
     fields = ["gid", "role", "role_score", "cluster_id", "priority_score", "depth",
               "is_seed", "in_deg", "out_deg", "in_kzt", "out_kzt", "in_tx", "out_tx",
-              "pass_through", "truncated_by_depth", "seed_payers", "role_rule"]
+              "pass_through", "truncated_by_depth", "seed_payers", "role_rule",
+              "incoming_incomplete", "depth_known", "outgoing_coverage_known", "seed_incoming_incomplete"]
     node = match[[field for field in fields if field in match]].to_dict("records")[0]
     roles = nodes.set_index("gid").role.to_dict()
     counterparties = {}
@@ -381,7 +478,7 @@ def node_payload(nodes, edges, gid):
     return {"node": node, "counterparties": counterparties}
 
 
-def explain_node(gid, *, data_dir="data", out_dir="out"):
+def explain_node(gid, *, data_dir="data", out_dir="out", offline=False):
     """Карточка из готового nodes_roles.csv и рёбер; неизвестный gid -> ValueError."""
     import pandas as pd
 
@@ -389,7 +486,7 @@ def explain_node(gid, *, data_dir="data", out_dir="out"):
     nodes = pd.read_csv(Path(out_dir) / "nodes_roles.csv", dtype={"gid": str})
     edges = pd.read_parquet(Path(data_dir) / "edges.parquet",
                             columns=["src", "dst", "sum_kzt", "n_tx"])
-    return LLMLayer(out_dir).node_card(node_payload(nodes, edges, gid))
+    return LLMLayer(out_dir, offline=offline).node_card(node_payload(nodes, edges, gid))
 
 
 def main():
@@ -399,9 +496,10 @@ def main():
     parser.add_argument("gid")
     parser.add_argument("--data", type=Path, default=Path("data"))
     parser.add_argument("--out", type=Path, default=Path("out"))
+    parser.add_argument("--offline", action="store_true", help="Без чтения .env и обращений к API")
     args = parser.parse_args()
     try:
-        print(explain_node(args.gid, data_dir=args.data, out_dir=args.out))
+        print(explain_node(args.gid, data_dir=args.data, out_dir=args.out, offline=args.offline))
     except (OSError, ValueError) as error:
         parser.exit(1, f"{error}\n")
 

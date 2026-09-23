@@ -3,6 +3,8 @@
 __pycache__/
 .pytest_cache/
 out/llm_cache.json
+out/llm_cache.json.lock
 out/.llm_cache_*.tmp
 out/graph_*.html
 .DS_Store
+.workspace/

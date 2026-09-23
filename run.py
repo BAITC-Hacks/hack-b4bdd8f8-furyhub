@@ -36,6 +36,7 @@ THRESHOLDS = {
     "transit_out_deg": 1,
     "transit_pass_min": 0.8,
     "transit_pass_max": 1.2,
+    "incoming_out_in_ratio": 1.2,
     "terminal_in_kzt": 50_000,
     "depth_limit": 4,
 }
@@ -61,6 +62,15 @@ BETWEENNESS_SAMPLES = 500
 TOP_N = 25
 EVIDENCE_LIMIT = 200
 SEED_NOTE = "; seed: входящие суммы занижены методом сбора"
+INCOMPLETE_NOTE = "; возможен неполный вход или начальный остаток"
+OUTGOING_UNKNOWN_NOTE = "; полнота исходящих неизвестна"
+
+
+def normalize_seed_flags(values, name="is_seed"):
+    """Булевы флаги и числовые 0/1 приводим к безопасной булевой маске."""
+    if values.isna().any() or not values.isin([True, False]).all():
+        raise ValueError(f"{name} должен содержать только bool или числовые 0/1")
+    return values.astype(bool)
 
 
 def validate_inputs(edges, nodes, tx):
@@ -78,8 +88,10 @@ def validate_inputs(edges, nodes, tx):
         raise ValueError("edges должен содержать одну строку на направленную пару")
     if (set(edges.src) | set(edges.dst)) - set(nodes.gid):
         raise ValueError("В edges есть узлы, отсутствующие в nodes")
-    if not nodes.is_seed.isin([True, False]).all():
-        raise ValueError("is_seed должен содержать только булевы значения")
+    normalize_seed_flags(nodes.is_seed)
+    for column in ("depth_known", "outgoing_coverage_known", "seed_incoming_incomplete"):
+        if column in nodes:
+            normalize_seed_flags(nodes[column], column)
     if not edges.sum_kzt.gt(0).all() or not tx.sum_kzt.gt(0).all():
         raise ValueError("Для взвешенных кратчайших путей суммы должны быть > 0")
     aggregated = tx.groupby(["src", "dst"]).agg(
@@ -110,11 +122,19 @@ def undirected_projection(graph):
 
 
 def compute_features(edges, nodes):
+    # Seed фиксирует выборку только при одинаковом порядке вершин и рёбер.
+    nodes = nodes.sort_values("gid").reset_index(drop=True).copy()
+    nodes["is_seed"] = normalize_seed_flags(nodes.is_seed)
+    edges = edges.sort_values(["src", "dst"]).reset_index(drop=True)
     graph = build_graph(edges)
     graph.add_nodes_from(nodes.gid)  # Включая seed без единого ребра.
     df = basic_features(graph, nodes)
+    for column, default in (("depth_known", True), ("outgoing_coverage_known", True),
+                            ("seed_incoming_incomplete", nodes.is_seed)):
+        values = nodes[column] if column in nodes else pd.Series(default, index=nodes.index)
+        df[column] = normalize_seed_flags(values, column)
     df["truncated_by_depth"] = (
-        df.depth.eq(THRESHOLDS["depth_limit"]) & df.out_deg.eq(0)
+        df.depth_known & df.depth.eq(THRESHOLDS["depth_limit"]) & df.out_deg.eq(0)
     )
     df["turnover_kzt"] = df.in_kzt + df.out_kzt
     between = nx.betweenness_centrality(
@@ -123,7 +143,10 @@ def compute_features(edges, nodes):
     )
     df["betweenness"] = df.gid.map(between)
 
-    if graph.number_of_edges():
+    if len(graph) == 1 and graph.number_of_edges():
+        # scipy.svds внутри HITS требует матрицу больше 1x1.
+        hubs = authorities = dict.fromkeys(graph, 1.0)
+    elif graph.number_of_edges():
         # nx.hits использует атрибут weight, отдельного аргумента weight нет.
         nx.set_edge_attributes(graph, nx.get_edge_attributes(graph, "sum_kzt"), "weight")
         hubs, authorities = nx.hits(
@@ -162,12 +185,24 @@ def assign_roles(df):
     """Первое совпадение выигрывает; пороги уточнены по проверке выгрузок."""
     df = df.copy()
     t = THRESHOLDS
+    df["is_seed"] = normalize_seed_flags(df.is_seed)
+    for column, default in (("depth_known", True), ("outgoing_coverage_known", True),
+                            ("seed_incoming_incomplete", df.is_seed)):
+        values = df[column] if column in df else pd.Series(default, index=df.index)
+        df[column] = normalize_seed_flags(values, column)
+    # Это ограничение наблюдаемого баланса, а не доказательство транзита.
+    df["incoming_incomplete"] = (df.is_seed & df.seed_incoming_incomplete) | (
+        df.out_deg.ge(t["transit_out_deg"])
+        & (df.in_deg.eq(0) | df.pass_through.gt(t["incoming_out_in_ratio"]))
+    )
     cutoff = df.betweenness.quantile(t["coordinator_betweenness_quantile"])
     max_between = df.betweenness.max()
     roles, scores, reasons = [], [], []
     for row in df.itertuples(index=False):
         if row.in_deg == 0 and row.out_deg == 0:
             role, score, reason = "peripheral", 0.2, "no_edges"
+        elif row.depth_known and row.out_deg == 0 and row.depth == t["depth_limit"]:
+            role, score, reason = "peripheral", 0.3, "truncated"
         elif (
             row.in_deg >= t["coordinator_in_deg"]
             and row.out_deg >= t["coordinator_out_deg"]
@@ -182,7 +217,8 @@ def assign_roles(df):
             role = reason = "distributor"
             score = min(0.95, 0.5 + 0.05 * (row.out_deg // 10))
         elif (
-            row.pass_through < t["consolidator_out_in_ratio"]
+            row.outgoing_coverage_known
+            and row.pass_through < t["consolidator_out_in_ratio"]
             and (
                 row.in_deg >= t["consolidator_in_deg"]
                 or (
@@ -203,20 +239,14 @@ def assign_roles(df):
         ):
             role = reason = "transit"
             score = max(0.0, 0.9 - abs(1.0 - row.pass_through))
+        elif row.incoming_incomplete and not row.is_seed:
+            role, score, reason = "peripheral", 0.4, "missing_incoming"
         elif (
-            not row.is_seed
-            and row.in_deg >= t["transit_in_deg"]
-            and row.out_deg >= t["transit_out_deg"]
-            and row.pass_through > t["transit_pass_max"]
-        ):
-            role, score, reason = "transit", 0.5, "transit_missing_incoming"
-        elif (
-            row.out_deg == 0 and row.depth < t["depth_limit"]
+            row.outgoing_coverage_known
+            and row.out_deg == 0 and (not row.depth_known or row.depth < t["depth_limit"])
             and row.in_kzt >= t["terminal_in_kzt"]
         ):
             role, score, reason = "terminal", 0.7, "terminal"
-        elif row.out_deg == 0 and row.depth == t["depth_limit"]:
-            role, score, reason = "peripheral", 0.3, "truncated"
         else:
             role, score, reason = "peripheral", 0.4, "other"
         roles.append(role)
@@ -260,22 +290,27 @@ def evidence(row):
         seed_payers = f"из них seed-плательщиков {row.seed_payers}; " if row.is_seed else ""
         text = (f"Вход {incoming} KZT от {payers}; {seed_payers}"
                 f"передаёт {row.pass_through:.1%}; признаки консолидации")
-    elif row.role_rule == "transit_missing_incoming":
-        text = (f"отдаёт в {row.pass_through:.2f} раз больше видимого входа — "
-                "вероятны входящие вне выборки; кандидат на запрос входящих переводов")
+    elif row.role_rule == "missing_incoming":
+        text = (f"Вход {incoming}, выход {outgoing} KZT; возможны пропущенные входящие "
+                "или начальный остаток; для проверки запросить выписку")
     elif row.role == "transit":
         text = (f"Вход {incoming}, выход {outgoing} KZT; передаёт {row.pass_through:.1%}; "
                 f"{row.in_deg}/{row.out_deg} связей; признаки транзита")
     elif row.role == "terminal":
+        boundary = f"глубина {row.depth}" if getattr(row, "depth_known", True) else "за наблюдаемый период"
         text = (f"Вход {incoming} KZT от {payers}, выход 0; "
-                f"глубина {row.depth}; признаки конечного получателя")
+                f"{boundary}; признаки конечного получателя")
     elif row.role_rule == "truncated":
         text = (f"Глубина {row.depth}, выход 0, вход {incoming} KZT; "
                 "обход обрезан, данных для гипотезы о конечном получателе недостаточно")
     else:
         text = (f"Вход/выход: {row.in_deg}/{row.out_deg} связей, "
                 f"{incoming}/{outgoing} KZT; признаков специальной роли недостаточно")
-    note = SEED_NOTE if row.is_seed else ""
+    note = SEED_NOTE if row.is_seed and getattr(row, "seed_incoming_incomplete", True) else ""
+    if getattr(row, "incoming_incomplete", False) and not note and row.role_rule != "missing_incoming":
+        note = INCOMPLETE_NOTE
+    if not getattr(row, "outgoing_coverage_known", True):
+        note += OUTGOING_UNKNOWN_NOTE
     # Оговорка о seed сохраняется целиком даже при необычно длинных числах.
     budget = EVIDENCE_LIMIT - len(note)
     if len(text) > budget:
@@ -287,7 +322,7 @@ def rank_nodes(df):
     return df.sort_values(["priority_score", "gid"], ascending=[False, True])
 
 
-def cluster_summary(df, edges, out_dir=Path("out")):
+def cluster_summary(df, edges, out_dir=Path("out"), *, offline=False):
     membership = df.set_index("gid").cluster_id
     src_cluster = edges.src.map(membership)
     dst_cluster = edges.dst.map(membership)
@@ -299,7 +334,9 @@ def cluster_summary(df, edges, out_dir=Path("out")):
     metrics = ["gid", "role", "role_score", "priority_score", "in_deg", "out_deg",
                "in_kzt", "out_kzt", "in_tx", "out_tx", "pass_through", "pagerank",
                "betweenness", "hubs", "authorities", "seed_payers",
-               "is_seed", "depth", "truncated_by_depth"]
+               "is_seed", "depth", "truncated_by_depth", "incoming_incomplete"]
+    metrics += [field for field in ("depth_known", "outgoing_coverage_known", "seed_incoming_incomplete")
+                if field in df]
     for cid, group in df.groupby("cluster_id", sort=True):
         n_nodes, n_seed = len(group), int(group.is_seed.sum())
         amount = float(sums.get(cid, 0.0))
@@ -313,19 +350,21 @@ def cluster_summary(df, edges, out_dir=Path("out")):
             "sum_kzt_internal": amount, "turnover_kzt": turnover,
             "turnover_share": turnover / total_turnover if total_turnover else 0.0,
             "role_counts": counts.to_dict(), "top_nodes": top_metrics.to_dict("records"),
+            "seed_incoming_incomplete": bool(group.get("seed_incoming_incomplete", group.is_seed).any()),
+            "outgoing_coverage_known": bool(group.get("outgoing_coverage_known", pd.Series(True, index=group.index)).all()),
         })
         rows.append({
             "cluster_id": cid, "n_nodes": n_nodes, "n_seed": n_seed,
             "sum_kzt_internal": amount,
             "top_gids": ";".join(top.gid.astype(str)),
         })
-    hypotheses = LLMLayer(out_dir).hypotheses(aggregates)
+    hypotheses = LLMLayer(out_dir, offline=offline).hypotheses(aggregates)
     for row, hypothesis in zip(rows, hypotheses):
         row["hypothesis"] = hypothesis
     return pd.DataFrame(rows)
 
 
-def write_outputs(df, edges, out_dir):
+def write_outputs(df, edges, out_dir, *, offline=False):
     required = ["gid", "role", "role_score", "cluster_id", "priority_score", "evidence"]
     if df[required].isna().any().any() or df.gid.duplicated().any():
         raise ValueError("Пустые обязательные поля или повторные gid в результате")
@@ -339,7 +378,7 @@ def write_outputs(df, edges, out_dir):
     top = rank_nodes(df).head(TOP_N)[["gid", "role", "priority_score", "evidence"]]
     top = top.rename(columns={"evidence": "why"})
     top.insert(0, "rank", range(1, len(top) + 1))
-    clusters = cluster_summary(df, edges, out_dir)
+    clusters = cluster_summary(df, edges, out_dir, offline=offline)
     out_dir.mkdir(parents=True, exist_ok=True)
     df[required + [c for c in df if c not in required]].to_csv(
         out_dir / "nodes_roles.csv", index=False, encoding="utf-8"
@@ -355,15 +394,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path("data"))
     parser.add_argument("--out", type=Path, default=Path("out"))
+    parser.add_argument("--offline", action="store_true",
+                        help="Без чтения API-ключа и обращений к OpenAI")
     args = parser.parse_args()
     started = perf_counter()
     edges, nodes, tx = load(args.data)
+    nodes["is_seed"] = normalize_seed_flags(nodes.is_seed)
     validate_inputs(edges, nodes, tx)
     sanity_check(edges, nodes, tx)
     print("Расчёт метрик и Louvain...", flush=True)
     df = add_priority(assign_roles(compute_features(edges, nodes)))
     df["evidence"] = [evidence(row) for row in df.itertuples(index=False)]
-    n_clusters = write_outputs(df, edges, args.out)
+    n_clusters = write_outputs(df, edges, args.out, offline=args.offline)
     print(f"Записаны 3 CSV в {args.out.resolve()}")
     print(f"Узлов: {len(df)}; кластеров: {n_clusters}; топ: {min(TOP_N, len(df))}")
     print(f"Время полного прогона: {perf_counter() - started:.2f} с")

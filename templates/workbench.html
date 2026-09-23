@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>FuryHub · Рабочее место аналитика</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='workbench.css') }}">
+  <script defer src="{{ url_for('static', filename='workbench.js') }}"></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Перейти к рабочей области</a>
+  <header class="app-header">
+    <a class="brand" href="/" aria-label="FuryHub — главная">FuryHub<span>Граф денег</span></a>
+    <div class="header-context">Рабочее место аналитика<span class="local-badge"><i></i>Локально</span></div>
+    <div class="header-actions">
+      <button id="demo-button" class="button quiet" type="button" disabled>Открыть демо</button>
+      <button id="new-import" class="button primary" type="button" disabled>+ Импортировать</button>
+    </div>
+  </header>
+
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="История работы">
+      <div class="sidebar-heading"><span class="eyebrow">Рабочая область</span><button id="refresh-history" class="text-button" type="button" disabled>Обновить</button></div>
+      <div class="history-tabs" role="tablist" aria-label="История">
+        <button id="runs-tab" type="button" role="tab" aria-selected="true" aria-controls="runs-history">Запуски <span id="runs-count">0</span></button>
+        <button id="datasets-tab" type="button" role="tab" aria-selected="false" aria-controls="datasets-history">Наборы <span id="datasets-count">0</span></button>
+      </div>
+      <section id="runs-history" class="history-list" role="tabpanel" aria-labelledby="runs-tab"><p class="empty-small">Загружаем историю…</p></section>
+      <section id="datasets-history" class="history-list" role="tabpanel" aria-labelledby="datasets-tab" hidden></section>
+      <div class="sidebar-bottom"><p>Данные остаются на этом компьютере.</p><span>Один аналитик · CSV / Parquet<br>KZT · AI выключен</span></div>
+    </aside>
+
+    <main id="workspace" tabindex="-1">
+      <div id="global-message" class="notice" role="status" aria-live="polite" hidden></div>
+
+      <section id="welcome" class="welcome">
+        <p class="eyebrow">От данных к проверке</p>
+        <h1>Увидеть связи.<br><em>Проверить гипотезу.</em></h1>
+        <p>Загрузите переводы, изучите движение денег и сохраните результаты работы по выбранным участникам сети.</p>
+        <div class="welcome-steps"><span><b>01</b> Импорт переводов</span><span><b>02</b> Анализ сети</span><span><b>03</b> Очередь проверки</span></div>
+      </section>
+
+      <section id="import-panel" class="panel import-panel" aria-labelledby="import-heading">
+        <div class="panel-heading"><div><p class="eyebrow">Новый набор данных</p><h2 id="import-heading">Начните с переводов</h2></div><a href="/api/template.csv" class="text-link" download>Скачать шаблон CSV ↗</a></div>
+        <form id="import-form">
+          <label id="drop-zone" class="drop-zone" for="upload-file">
+            <span class="upload-symbol" aria-hidden="true">↑</span>
+            <strong id="upload-title">Выберите файл или перетащите его сюда</strong>
+            <span id="upload-help">CSV или Parquet · отправитель, получатель, сумма и дата</span>
+            <input id="upload-file" name="file" type="file" accept=".csv,.parquet" disabled>
+          </label>
+          <div id="upload-status" class="upload-status" role="status" aria-live="polite"></div>
+          <div id="upload-details" hidden>
+            <div class="section-heading"><h3>Сопоставьте колонки</h3><span>Обязательные поля отмечены *</span></div>
+            <p class="form-help">Укажите, какие колонки файла содержат эти данные. Идентификаторы клиентов сохраняются точно.</p>
+            <div id="mapping-fields" class="mapping-grid"></div>
+            <details class="preview-section" open><summary>Первые строки файла <span id="preview-count"></span></summary><div class="table-scroll"><table id="preview-table"><thead></thead><tbody></tbody></table></div></details>
+          </div>
+          <div class="form-grid metadata-fields">
+            <label>Название набора *<input id="dataset-name" type="text" maxlength="160" required placeholder="Например, переводы за июль"></label>
+            <label>Источник данных<input id="dataset-source" type="text" maxlength="500" placeholder="Название выгрузки или системы"></label>
+            <label>Полнота исходящих переводов<select id="dataset-coverage"><option value="unknown">Неизвестна</option><option value="complete">Полная за указанный период</option></select></label>
+            <label>Валюта<input value="KZT · казахстанский тенге" readonly aria-label="Валюта — казахстанский тенге"></label>
+          </div>
+          <p id="coverage-help" class="coverage-help">Если полнота неизвестна, отсутствие исходящих переводов не означает, что средства остались у получателя.</p>
+          <details class="seed-section"><summary>Исходные клиенты <span>необязательно</span></summary><label for="seed-gids" class="form-help">Gid клиентов, от которых начиналась выгрузка. По одному в строке или через запятую.</label><textarea id="seed-gids" rows="3" spellcheck="false" placeholder="Полные идентификаторы клиентов"></textarea></details>
+          <section id="validation-panel" class="validation-panel" role="alert" hidden><h3>Проверьте данные</h3><p id="validation-message"></p><div class="table-scroll"><table><thead><tr><th>Строка</th><th>Колонка</th><th>Что исправить</th></tr></thead><tbody id="validation-errors"></tbody></table></div></section>
+          <div class="form-footer"><p>Анализ строит объяснимые гипотезы по доступной сети. Роли не являются выводом о нарушении.</p><div><button id="save-dataset" class="button secondary" type="button" disabled>Сохранить набор</button><button id="start-import" class="button primary" type="submit" disabled>Проверить и запустить →</button></div></div>
+        </form>
+      </section>
+
+      <section id="dataset-panel" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Набор данных</p><h1 id="dataset-title"></h1><p id="dataset-description" class="muted"></p></div><button id="analyze-dataset" class="button primary" type="button">Запустить анализ →</button></div>
+        <div id="dataset-summary" class="summary-grid"></div><div id="dataset-warnings" class="notice warning" hidden></div>
+      </section>
+
+      <section id="run-panel" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Анализ сети переводов</p><h1 id="run-title"></h1><p id="run-meta" class="muted"></p></div><span id="run-status" class="status-chip"></span></div>
+        <div id="run-summary" class="summary-grid"></div><div id="run-warnings" class="notice warning" hidden></div>
+        <div id="run-progress" class="panel progress-panel" role="status" aria-live="polite" hidden><div class="progress-label"><strong id="run-phase">Подготовка анализа</strong><span id="run-percent">0%</span></div><progress id="progress-bar" max="100" value="0"></progress><p>Можно продолжить работу: результаты появятся здесь после завершения.</p></div>
+        <div id="run-error" class="notice error" role="alert" hidden><strong>Анализ не завершён</strong><p id="run-error-text"></p><button id="retry-run" class="button secondary" type="button">Повторить запуск</button></div>
+
+        <div id="run-results" hidden>
+          <div class="results-bar"><div class="result-tabs" role="tablist" aria-label="Результаты анализа"><button id="graph-tab" type="button" role="tab" aria-selected="true" aria-controls="graph-panel">Граф переводов</button><button id="cases-tab" type="button" role="tab" aria-selected="false" aria-controls="cases-panel">Работа по узлам <span id="cases-count">0</span></button></div><details class="download-menu"><summary>Скачать результаты ↓</summary><div id="download-links"></div></details></div>
+          <section id="graph-panel" role="tabpanel" aria-labelledby="graph-tab"><div class="graph-frame-wrap"><iframe id="graph-frame" title="Интерактивный граф переводов" src="about:blank"></iframe></div><div class="graph-footer"><span>Выберите узел на схеме, чтобы начать проверку.</span><button id="open-selected-case" class="text-button" type="button" hidden>Открыть проверку →</button></div></section>
+          <section id="cases-panel" class="case-workspace" role="tabpanel" aria-labelledby="cases-tab" hidden>
+            <aside class="node-browser panel"><h2>Участники сети</h2><form id="node-search-form" class="node-search"><input id="node-query" type="search" autocomplete="off" placeholder="Найти по gid" aria-label="Поиск узла по gid"><button class="button secondary" type="submit">Найти</button></form><div class="node-filter"><button id="all-nodes-filter" class="text-button active" type="button" aria-pressed="true">Все узлы</button><button id="saved-cases-filter" class="text-button" type="button" aria-pressed="false">Мои проверки</button></div><p id="node-result-count" class="form-help"></p><div id="node-list" class="node-list"></div></aside>
+            <section class="case-editor panel" aria-labelledby="case-heading"><div id="case-empty" class="empty-state"><span class="eyebrow">Работа по узлу</span><h2 id="case-heading">Сначала выберите клиента</h2><p>Найдите gid в списке или выберите узел на графе. Здесь можно сохранить статус, заметку и историю проверки.</p></div><div id="case-content" hidden><div class="case-heading"><div><p class="eyebrow">Карточка проверки</p><h2 id="case-gid"></h2></div><button id="copy-case-gid" class="text-button" type="button">Копировать gid</button></div><p id="case-evidence" class="case-evidence"></p><form id="case-form"><fieldset id="case-fields" disabled><label>Статус проверки<select id="case-status"><option value="new">Новая</option><option value="in_progress">В работе</option><option value="needs_info">Нужны данные</option><option value="closed">Закрыта</option></select></label><label>Заметка аналитика<textarea id="case-note" rows="6" placeholder="Что проверено, какие вопросы остались и какие данные нужно запросить"></textarea></label><div class="case-save"><span id="case-save-state" class="form-help" role="status"></span><button id="save-case" class="button primary" type="submit">Сохранить проверку</button></div></fieldset></form><section class="case-history"><h3>История изменений</h3><ol id="case-events"></ol></section></div></section>
+          </section>
+        </div>
+      </section>
+      <footer class="workspace-footer">FuryHub · Локальный анализ переводов. Результаты требуют проверки аналитиком.</footer>
+    </main>
+  </div>
+</body>
+</html>
