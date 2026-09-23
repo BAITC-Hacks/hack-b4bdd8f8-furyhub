@@ -4,6 +4,7 @@
 """
 
 from pathlib import Path
+import re
 import unittest
 
 import networkx as nx
@@ -176,10 +177,9 @@ class OutputTests(unittest.TestCase):
             self.assertIn(f"доля общего оборота (вход + выход) — {share:.2%}", cluster.hypothesis)
             if cluster.n_seed == 0:
                 self.assertIn("связь с делом не подтверждена", cluster.hypothesis)
-            if cluster.n_seed >= 3 and group.role.eq("consolidator").any():
-                self.assertIn("признаки сбора средств от курьеров", cluster.hypothesis)
-            if group.role.eq("distributor").any() and group.role.eq("terminal").sum() >= 3:
-                self.assertIn("признаки веерного распределения", cluster.hypothesis)
+            self.assertEqual(len(re.findall(r"[.!?](?:\s|$)", cluster.hypothesis)), 2)
+            self.assertIn("Для проверки следует", cluster.hypothesis)
+            self.assertNotIn("курьеров", cluster.hypothesis)
 
 
 if __name__ == "__main__":

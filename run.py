@@ -17,6 +17,7 @@ from time import perf_counter
 import networkx as nx
 import pandas as pd
 
+from llm_layer import LLMLayer
 from starter.starter import ROLES, basic_features, build_graph, load, sanity_check
 
 
@@ -286,7 +287,7 @@ def rank_nodes(df):
     return df.sort_values(["priority_score", "gid"], ascending=[False, True])
 
 
-def cluster_summary(df, edges):
+def cluster_summary(df, edges, out_dir=Path("out")):
     membership = df.set_index("gid").cluster_id
     src_cluster = edges.src.map(membership)
     dst_cluster = edges.dst.map(membership)
@@ -294,39 +295,33 @@ def cluster_summary(df, edges):
     internal["cluster_id"] = src_cluster.loc[internal.index]
     sums = internal.groupby("cluster_id").sum_kzt.sum()
     total_turnover = df.turnover_kzt.sum()
-    rows = []
+    rows, aggregates = [], []
+    metrics = ["gid", "role", "role_score", "priority_score", "in_deg", "out_deg",
+               "in_kzt", "out_kzt", "in_tx", "out_tx", "pass_through", "pagerank",
+               "betweenness", "hubs", "authorities", "seed_payers",
+               "is_seed", "depth", "truncated_by_depth"]
     for cid, group in df.groupby("cluster_id", sort=True):
         n_nodes, n_seed = len(group), int(group.is_seed.sum())
         amount = float(sums.get(cid, 0.0))
         counts = group.role.value_counts().reindex(ROLES, fill_value=0)
-        turnover_share = group.turnover_kzt.sum() / total_turnover if total_turnover else 0.0
-        observations = []
-        if n_seed == 0:
-            observations.append("связь с делом не подтверждена, вероятно, downstream-получатели")
-        if counts["consolidator"]:
-            observations.append(
-                "признаки сбора средств от курьеров" if n_seed >= 3
-                else "признаки консолидации средств"
-            )
-        if counts["coordinator"]:
-            observations.append("возможная координация денежных потоков")
-        if counts["distributor"] and counts["terminal"] >= 3:
-            observations.append("признаки веерного распределения")
-        if not observations:
-            observations.append("назначение группы денежных потоков требует уточнения")
-        if turnover_share >= 0.10:
-            observations.append("значимая доля общего оборота, проверить назначение крупных потоков")
-        composition = ", ".join(f"{role} — {int(counts[role])}" for role in ROLES)
+        turnover = float(group.turnover_kzt.sum())
+        top = rank_nodes(group).head(5)
+        top_metrics = top[metrics].copy()
+        top_metrics["gid"] = top_metrics.gid.astype(str)
+        aggregates.append({
+            "cluster_id": int(cid), "n_nodes": n_nodes, "n_seed": n_seed,
+            "sum_kzt_internal": amount, "turnover_kzt": turnover,
+            "turnover_share": turnover / total_turnover if total_turnover else 0.0,
+            "role_counts": counts.to_dict(), "top_nodes": top_metrics.to_dict("records"),
+        })
         rows.append({
             "cluster_id": cid, "n_nodes": n_nodes, "n_seed": n_seed,
             "sum_kzt_internal": amount,
-            "top_gids": ";".join(rank_nodes(group).head(5).gid.astype(str)),
-            "hypothesis": (f"Гипотеза для проверки: группа из {n_nodes} узлов, "
-                           f"seed — {n_seed}; роли: {composition}; "
-                           f"внутренние переводы {amount:,.0f} KZT; "
-                           f"доля общего оборота (вход + выход) — {turnover_share:.2%}; "
-                           + "; ".join(observations) + "."),
+            "top_gids": ";".join(top.gid.astype(str)),
         })
+    hypotheses = LLMLayer(out_dir).hypotheses(aggregates)
+    for row, hypothesis in zip(rows, hypotheses):
+        row["hypothesis"] = hypothesis
     return pd.DataFrame(rows)
 
 
@@ -344,7 +339,7 @@ def write_outputs(df, edges, out_dir):
     top = rank_nodes(df).head(TOP_N)[["gid", "role", "priority_score", "evidence"]]
     top = top.rename(columns={"evidence": "why"})
     top.insert(0, "rank", range(1, len(top) + 1))
-    clusters = cluster_summary(df, edges)
+    clusters = cluster_summary(df, edges, out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     df[required + [c for c in df if c not in required]].to_csv(
         out_dir / "nodes_roles.csv", index=False, encoding="utf-8"
