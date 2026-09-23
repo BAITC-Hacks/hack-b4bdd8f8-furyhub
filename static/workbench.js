@@ -16,6 +16,7 @@
         historyTab: 'runs', view: 'import', resultTab: 'graph', pollTimer: null,
         nodes: [], cases: [], onlyCases: false, gid: null, caseValue: null,
         nodeSequence: 0, caseSequence: 0, searchTimer: null, drafts: new Map(), savingCase: false,
+        savingCaseKey: null, caseLoading: false,
     };
     const roles = {coordinator: 'Координатор', distributor: 'Распределитель', consolidator: 'Консолидатор', transit: 'Транзит', terminal: 'Конечный получатель', peripheral: 'Периферия'};
     const runStatuses = {queued: 'В очереди', running: 'Выполняется', completed: 'Готово', failed: 'Ошибка'};
@@ -183,6 +184,20 @@
         if (index < 0) state.runs.unshift(run); else state.runs[index] = run;
     }
 
+    function reconcileRuns(incoming) {
+        const result = new Map(state.runs.map(run => [String(run.id), run]));
+        const stage = {queued: 0, running: 1, completed: 2, failed: 2};
+        for (const run of incoming) {
+            const old = result.get(String(run.id));
+            // Поздний ответ опроса не должен стирать только что созданный запуск
+            // или возвращать завершённый анализ в состояние «в очереди».
+            if (old && (stage[old.status] > stage[run.status]
+                || (old.status === run.status && isActive(old) && Number(old.progress) > Number(run.progress)))) continue;
+            result.set(String(run.id), run);
+        }
+        return [...result.values()];
+    }
+
     function mergeDataset(dataset) {
         const index = state.datasets.findIndex(item => String(item.id) === String(dataset.id));
         if (index < 0) state.datasets.unshift(dataset); else state.datasets[index] = dataset;
@@ -190,8 +205,8 @@
 
     async function refreshHistory() {
         const [datasets, runs] = await Promise.all([api('/api/datasets'), api('/api/runs')]);
-        state.datasets = datasets.datasets || [];
-        state.runs = runs.runs || [];
+        for (const dataset of datasets.datasets || []) mergeDataset(dataset);
+        state.runs = reconcileRuns(runs.runs || []);
         renderHistory();
         if (state.view === 'run' && currentRun()) renderRun(currentRun());
         schedulePoll();
@@ -208,8 +223,9 @@
             state.nodes = [];
             state.nodeSequence++;
             state.caseSequence++;
-            text('node-query', '');
             el('node-query').value = '';
+            text('cases-count', '0');
+            state.nodeTotal = 0;
             visible('case-content', false);
             visible('case-empty', true);
             visible('open-selected-case', false);
@@ -271,7 +287,7 @@
         state.pollTimer = setTimeout(async () => {
             try {
                 const payload = await api('/api/runs');
-                state.runs = payload.runs || [];
+                state.runs = reconcileRuns(payload.runs || []);
                 renderHistory();
                 if (state.view === 'run') renderRun(currentRun());
                 schedulePoll();
@@ -285,6 +301,7 @@
     function updateImportButtons() {
         const unavailable = !state.ready || state.importBusy;
         el('upload-file').disabled = unavailable;
+        el('new-import').disabled = unavailable;
         el('start-import').disabled = unavailable || !state.upload;
         el('save-dataset').disabled = unavailable || !state.upload;
     }
@@ -341,6 +358,9 @@
 
     async function uploadFile(file) {
         if (!file || state.importBusy || !state.ready) return;
+        state.upload = null;
+        visible('upload-details', false);
+        updateImportButtons();
         visible('validation-panel', false);
         if (!/\.(csv|parquet)$/i.test(file.name)) {
             validation(new Error('Выберите файл в формате CSV или Parquet.'));
@@ -351,7 +371,6 @@
             return;
         }
         const sequence = ++state.uploadSequence;
-        state.upload = null;
         state.importBusy = true;
         updateImportButtons();
         visible('upload-details', false);
@@ -486,7 +505,7 @@
         const draft = state.drafts.get(draftKey());
         el('case-status').value = draft?.status || caseValue?.status || 'new';
         el('case-note').value = draft?.note ?? caseValue?.note ?? '';
-        el('case-fields').disabled = false;
+        el('case-fields').disabled = state.savingCase && state.savingCaseKey === draftKey();
         text('case-save-state', draft ? 'Есть несохранённые изменения' : caseValue?.updated_at ? `Сохранено ${date(caseValue.updated_at, true)}` : 'Ещё не сохранено');
         renderEvents(events);
     }
@@ -495,12 +514,16 @@
         const runId = state.runId;
         if (!runId || currentRun()?.status !== 'completed') return;
         state.gid = String(gid);
+        state.caseLoading = true;
         const sequence = ++state.caseSequence;
         node = node || state.nodes.find(item => String(item.gid) === state.gid);
         text('case-gid', state.gid);
         text('case-evidence', node?.evidence || 'Графовая роль — гипотеза. Сопоставьте её с доступными переводами и дополнительными данными.');
         text('copy-case-gid', 'Копировать gid');
         text('case-save-state', 'Загружаем проверку…');
+        el('case-status').value = 'new';
+        el('case-note').value = '';
+        el('case-events').replaceChildren();
         el('case-fields').disabled = true;
         visible('case-empty', false);
         visible('case-content', true);
@@ -510,9 +533,11 @@
         try {
             const payload = await api(`/api/runs/${encodeURIComponent(runId)}/cases/${encodeURIComponent(gid)}`);
             if (runId !== state.runId || sequence !== state.caseSequence) return;
+            state.caseLoading = false;
             renderCase(payload.case, payload.events);
         } catch (error) {
             if (runId === state.runId && sequence === state.caseSequence) {
+                state.caseLoading = false;
                 text('case-save-state', 'Не удалось загрузить проверку. Выберите узел ещё раз.');
                 notify(error.message, 'error');
             }
@@ -537,6 +562,8 @@
         const runId = state.runId, gid = state.gid, key = draftKey();
         const body = {status: el('case-status').value, note: el('case-note').value};
         state.savingCase = true;
+        state.savingCaseKey = key;
+        el('case-fields').disabled = true;
         el('save-case').disabled = true;
         text('case-save-state', 'Сохраняем…');
         try {
@@ -551,7 +578,10 @@
         } catch (error) {
             if (runId === state.runId && gid === state.gid) text('case-save-state', 'Не сохранено. Повторите действие.');
             notify(error.message, 'error');
-        } finally { state.savingCase = false; el('save-case').disabled = false; }
+        } finally {
+            state.savingCase = false; state.savingCaseKey = null; el('save-case').disabled = false;
+            if (state.runId === runId && state.gid === gid && !state.caseLoading) el('case-fields').disabled = false;
+        }
     }
 
     el('runs-tab').addEventListener('click', () => setHistoryTab('runs'));
@@ -559,7 +589,20 @@
     el('graph-tab').addEventListener('click', () => setResultTab('graph'));
     el('cases-tab').addEventListener('click', () => setResultTab('cases'));
     el('open-selected-case').addEventListener('click', () => setResultTab('cases'));
-    el('new-import').addEventListener('click', () => { setView('import'); notify(''); el('import-heading').scrollIntoView({behavior: 'smooth', block: 'start'}); });
+    el('new-import').addEventListener('click', () => {
+        if (state.importBusy) return;
+        state.upload = null;
+        state.uploadSequence++;
+        el('import-form').reset();
+        el('mapping-fields').replaceChildren();
+        visible('upload-details', false); visible('validation-panel', false);
+        text('upload-title', 'Выберите файл или перетащите его сюда');
+        text('upload-status', '');
+        text('coverage-help', 'Если полнота неизвестна, отсутствие исходящих переводов не означает, что средства остались у получателя.');
+        updateImportButtons();
+        setView('import'); notify('');
+        el('import-heading').scrollIntoView({behavior: 'smooth', block: 'start'});
+    });
     el('refresh-history').addEventListener('click', async () => {
         el('refresh-history').disabled = true;
         try { await refreshHistory(); notify(''); } catch (error) { notify(error.message, 'error'); }
@@ -595,7 +638,7 @@
         finally { el('demo-button').disabled = false; }
     });
     el('node-search-form').addEventListener('submit', event => { event.preventDefault(); clearTimeout(state.searchTimer); void loadNodes(); });
-    el('node-query').addEventListener('input', () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(() => { void loadNodes(); }, 250); });
+    el('node-query').addEventListener('input', () => { state.nodeSequence++; clearTimeout(state.searchTimer); state.searchTimer = setTimeout(() => { void loadNodes(); }, 250); });
     for (const [id, onlyCases] of [['all-nodes-filter', false], ['saved-cases-filter', true]]) el(id).addEventListener('click', () => {
         state.onlyCases = onlyCases;
         state.nodeSequence++;
@@ -618,7 +661,7 @@
     window.addEventListener('message', event => {
         if (event.origin !== window.location.origin || event.source !== el('graph-frame').contentWindow) return;
         if (event.data?.type !== 'furyhub:node-selected' || typeof event.data.gid !== 'string') return;
-        if (state.view === 'run' && state.resultRunId === state.runId) void selectNode(event.data.gid);
+        if (state.view === 'run' && state.resultRunId === state.runId && state.gid !== event.data.gid) void selectNode(event.data.gid);
     });
     window.addEventListener('beforeunload', event => {
         if (state.drafts.size) { event.preventDefault(); event.returnValue = ''; }
