@@ -1,0 +1,4 @@
+-r starter/requirements.txt
+# Внутренняя численная зависимость NetworkX для PageRank и HITS; не ML.
+scipy>=1.10
+pyvis>=0.3.2,<0.4
