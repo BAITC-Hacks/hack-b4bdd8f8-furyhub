@@ -182,7 +182,8 @@ def _render_node(data, selection, options):
 class LLMLayer:
     """Один сеанс: общий бюджет API, circuit breaker и файловый кеш."""
 
-    def __init__(self, out_dir="out", *, env_path=None, model=None):
+    def __init__(self, out_dir="out", *, env_path=None, model=None,
+                 timeout_seconds=TIMEOUT_SECONDS, budget_seconds=LLM_BUDGET_SECONDS):
         self.cache_path = Path(out_dir) / "llm_cache.json"
         config = {}
         if dotenv_values is not None:
@@ -199,6 +200,8 @@ class LLMLayer:
         self._client = None
         self._failed = False
         self._deadline = None
+        self.timeout_seconds = float(timeout_seconds)
+        self.budget_seconds = float(budget_seconds)
 
     def _read_cache(self):
         try:
@@ -244,7 +247,7 @@ class LLMLayer:
         if self._failed or not self._key or OpenAI is None:
             return None
         if self._deadline is None:
-            self._deadline = monotonic() + LLM_BUDGET_SECONDS
+            self._deadline = monotonic() + self.budget_seconds
         remaining = self._deadline - monotonic()
         if remaining <= 0:
             return None
@@ -252,7 +255,7 @@ class LLMLayer:
                       for i, option in enumerate(options)}
         try:
             if self._client is None:
-                self._client = OpenAI(api_key=self._key, timeout=TIMEOUT_SECONDS,
+                self._client = OpenAI(api_key=self._key, timeout=self.timeout_seconds,
                                       max_retries=0, base_url="https://api.openai.com/v1")
             response = self._client.responses.create(
                 model=self.model, store=False,
@@ -261,7 +264,7 @@ class LLMLayer:
                              for i, (data, option) in enumerate(zip(batch, options))}),
                 text={"format": {"type": "json_schema", "name": f"aml_{kind}",
                                  "strict": True, "schema": _object_schema(properties)}},
-                timeout=min(TIMEOUT_SECONDS, remaining),
+                timeout=min(self.timeout_seconds, remaining),
                 max_output_tokens=max(512, 100 * len(batch)),
             )
             if response.status != "completed":
@@ -331,18 +334,31 @@ class LLMLayer:
         selected = self._select("node", [payload], [options])[0]
         return _render_node(payload, selected, options)
 
+    def node_hints(self, payloads):
+        """Подсказки в порядке узлов; до 25 новых узлов — один запрос API."""
+        payloads = _normalise(payloads)
+        options = [_node_options(data) for data in payloads]
+        selections = self._select("node", payloads, options)
+        return [
+            {field: option[field][selected[field]]
+             for field in ("attention", "next_request")}
+            for selected, option in zip(selections, options)
+        ]
+
 
 def cluster_hypothesis(aggregates, *, out_dir="out"):
     """Гипотеза по одному словарю агрегатов; для пайплайна лучше hypotheses()."""
     return LLMLayer(out_dir).hypotheses([aggregates])[0]
 
 
-def explain_node(gid, *, data_dir="data", out_dir="out"):
-    """Карточка из готового nodes_roles.csv и рёбер; неизвестный gid -> ValueError."""
-    import pandas as pd
+def node_payload(nodes, edges, gid):
+    """Готовые DataFrame -> прежний payload карточки, без чтения файлов.
 
-    # Строковый dtype обязателен: gid длиннее точного диапазона IEEE-754.
-    nodes = pd.read_csv(Path(out_dir) / "nodes_roles.csv", dtype={"gid": str})
+    gid и концы рёбер приводятся к строкам без изменения исходных таблиц.
+    Состав полей и сортировка соседей сохраняют совместимость LLM-кеша.
+    """
+    nodes = nodes.assign(gid=nodes.gid.astype(str))
+    edges = edges.assign(src=edges.src.astype(str), dst=edges.dst.astype(str))
     gid = str(gid)
     match = nodes.loc[nodes.gid.eq(gid)]
     if match.empty:
@@ -351,10 +367,6 @@ def explain_node(gid, *, data_dir="data", out_dir="out"):
               "is_seed", "in_deg", "out_deg", "in_kzt", "out_kzt", "in_tx", "out_tx",
               "pass_through", "truncated_by_depth", "seed_payers", "role_rule"]
     node = match[[field for field in fields if field in match]].to_dict("records")[0]
-    edges = pd.read_parquet(Path(data_dir) / "edges.parquet",
-                            columns=["src", "dst", "sum_kzt", "n_tx"])
-    edges["src"] = edges.src.astype(str)
-    edges["dst"] = edges.dst.astype(str)
     roles = nodes.set_index("gid").role.to_dict()
     counterparties = {}
     for direction, endpoint, peer in (("incoming", "dst", "src"), ("outgoing", "src", "dst")):
@@ -366,7 +378,18 @@ def explain_node(gid, *, data_dir="data", out_dir="out"):
              "sum_kzt": row.sum_kzt, "n_tx": row.n_tx}
             for row in connected.itertuples(index=False)
         ]
-    return LLMLayer(out_dir).node_card({"node": node, "counterparties": counterparties})
+    return {"node": node, "counterparties": counterparties}
+
+
+def explain_node(gid, *, data_dir="data", out_dir="out"):
+    """Карточка из готового nodes_roles.csv и рёбер; неизвестный gid -> ValueError."""
+    import pandas as pd
+
+    # Строковый dtype обязателен: gid длиннее точного диапазона IEEE-754.
+    nodes = pd.read_csv(Path(out_dir) / "nodes_roles.csv", dtype={"gid": str})
+    edges = pd.read_parquet(Path(data_dir) / "edges.parquet",
+                            columns=["src", "dst", "sum_kzt", "n_tx"])
+    return LLMLayer(out_dir).node_card(node_payload(nodes, edges, gid))
 
 
 def main():

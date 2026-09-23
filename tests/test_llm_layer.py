@@ -281,6 +281,75 @@ class LLMLayerTests(unittest.TestCase):
             second = self.layer("second").node_card(node_payload())
         self.assertNotEqual(first, second)
 
+    def test_node_hints_batch_preserves_order_and_shares_node_card_cache(self):
+        payloads = [node_payload(gid=str(int(GID) + index), is_seed=index == 0)
+                    for index in range(25)]
+        with self.api() as (_, create):
+            layer = self.layer()
+            hints = layer.node_hints(payloads)
+            cards = [layer.node_card(payload) for payload in payloads]
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(len(hints), 25)
+        self.assertNotEqual(hints[0]["attention"], hints[1]["attention"])
+        for hint, card in zip(hints, cards):
+            self.assertEqual(set(hint), {"attention", "next_request"})
+            self.assertIn(hint["attention"], card)
+            self.assertIn(hint["next_request"], card)
+        self.assertEqual(create.call_args.kwargs["text"]["format"]["name"], "aml_node")
+
+    def test_node_hints_offline_and_empty_batch(self):
+        with self.api(key=False) as (constructor, create):
+            layer = self.layer()
+            self.assertEqual(layer.node_hints([]), [])
+            hints = layer.node_hints([
+                node_payload(), node_payload(is_seed=False, truncated_by_depth=True),
+            ])
+        self.assertEqual(hints[0]["next_request"], llm_layer.REQUESTS["incoming"])
+        self.assertEqual(hints[1]["next_request"], llm_layer.REQUESTS["outgoing"])
+        constructor.assert_not_called()
+        create.assert_not_called()
+
+    def test_node_payload_keeps_legacy_fields_exact_ids_and_counterparty_order(self):
+        original = node_payload()["node"]
+        peer_ids = [str(int(OTHER_GID) + index) for index in range(7)]
+        nodes = pd.DataFrame([original] + [
+            node_payload(gid=peer, role="transit")["node"] for peer in peer_ids
+        ])
+        edges = pd.DataFrame([
+            {"src": int(peer), "dst": int(GID), "sum_kzt": 100.0, "n_tx": index + 1}
+            for index, peer in reversed(list(enumerate(peer_ids)))
+        ] + [{"src": int(GID), "dst": int(OTHER_GID), "sum_kzt": 90000.0, "n_tx": 5}])
+        saved_nodes, saved_edges = nodes.copy(deep=True), edges.copy(deep=True)
+        payload = llm_layer.node_payload(nodes, edges, int(GID))
+        legacy_fields = [
+            "gid", "role", "role_score", "cluster_id", "priority_score", "depth",
+            "is_seed", "in_deg", "out_deg", "in_kzt", "out_kzt", "in_tx", "out_tx",
+            "pass_through", "truncated_by_depth", "seed_payers", "role_rule",
+        ]
+        self.assertEqual(payload["node"], {field: original[field] for field in legacy_fields})
+        self.assertEqual(payload["counterparties"]["incoming"], [
+            {"gid": peer, "role": "transit", "sum_kzt": 100.0, "n_tx": index + 1}
+            for index, peer in enumerate(peer_ids[:5])
+        ])
+        self.assertEqual(payload["counterparties"]["outgoing"], [
+            {"gid": OTHER_GID, "role": "transit", "sum_kzt": 90000.0, "n_tx": 5}
+        ])
+        pd.testing.assert_frame_equal(nodes, saved_nodes)
+        pd.testing.assert_frame_equal(edges, saved_edges)
+        with self.assertRaisesRegex(ValueError, "не найден"):
+            llm_layer.node_payload(nodes, edges, "missing")
+
+    def test_short_timeout_and_budget_are_available_for_html_generation(self):
+        with self.api() as (constructor, create), \
+                patch.object(llm_layer, "monotonic", side_effect=[0.0, 2.0, 11.0]):
+            layer = llm_layer.LLMLayer(self.root / "out", env_path=self.env_path,
+                                       timeout_seconds=10.0, budget_seconds=10.0)
+            hints = layer.node_hints([node_payload(gid=str(int(GID) + i)) for i in range(26)])
+        self.assertEqual(len(hints), 26)
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(constructor.call_args.kwargs["timeout"], 10.0)
+        self.assertEqual(create.call_args.kwargs["timeout"], 8.0)
+
     def test_explain_node_reads_exact_large_ids_and_rejects_unknown(self):
         data = self.root / "data"
         out = self.root / "out"
